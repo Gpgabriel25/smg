@@ -15,8 +15,16 @@
 //! allowed there is no address to refuse, so a host is admitted by name
 //! alone: no lookup here and no pin, and the client (or the proxy) resolves
 //! it as it did before there was a policy.
+//!
+//! A URL that is not fetched here but handed on as written to another
+//! fetcher is judged by its text alone
+//! ([`MediaHostPolicy::check_as_written`]): the allow-list by the name it
+//! spells, the address policy by an address literal or a loopback name. What
+//! a name resolves to, and where a redirect leads, is then the fetcher's to
+//! judge.
 
 use std::{
+    borrow::Cow,
     collections::{hash_map::Entry, HashMap, HashSet},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -27,6 +35,10 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use url::{Host, Url};
 
 use crate::error::MediaConnectorError;
+
+/// The schemes media is fetched over: the only ones under which a URL names
+/// a host to fetch from.
+pub(crate) const FETCHED_SCHEMES: [&str; 2] = ["http", "https"];
 
 /// The allow-list and the address policy of one connector.
 #[derive(Debug)]
@@ -89,6 +101,98 @@ impl MediaHostPolicy {
         }
         Ok(host)
     }
+
+    /// The policy's verdict on a media URL that is not fetched here but
+    /// handed on as written to another fetcher, read from its text alone,
+    /// with no lookup. Only a URL of a scheme media is fetched over names a
+    /// host to judge ([`FETCHED_SCHEMES`]); any other text passes. The host
+    /// is held to the allow-list by name and, when the policy checks
+    /// addresses, to the address policy by what the name itself says
+    /// ([`Self::check_host_as_written`]).
+    ///
+    /// The verdict is on the host this side reads, and it holds for the
+    /// fetcher only if the fetcher reads the same host in the same text. So
+    /// the text is read as URL readers take it (nothing before the scheme,
+    /// no ASCII tab or newline anywhere), and a URL whose authority URL
+    /// readers split differently ([`authority_is_split_differently`]) or
+    /// that this side cannot parse is refused as invalid. A policy with no
+    /// allow-list that allows private hosts has nothing to refuse and reads
+    /// nothing.
+    pub(crate) fn check_as_written(&self, url: &str) -> Result<(), MediaConnectorError> {
+        if self.allowed_domains.is_none() && !self.checks_addresses() {
+            return Ok(());
+        }
+        let dropped = |c: char| matches!(c, '\t' | '\n' | '\r');
+        let text = url.trim_start_matches(|c: char| c <= ' ');
+        let text: Cow<'_, str> = if text.contains(dropped) {
+            Cow::Owned(text.chars().filter(|&c| !dropped(c)).collect())
+        } else {
+            Cow::Borrowed(text)
+        };
+        let Some(after_scheme) = after_fetched_scheme(&text) else {
+            return Ok(());
+        };
+        let invalid = || MediaConnectorError::InvalidUrl(url.to_string());
+        if authority_is_split_differently(after_scheme) {
+            return Err(invalid());
+        }
+        let parsed = Url::parse(&text).map_err(|_| invalid())?;
+        self.check_host_as_written(&parsed)
+    }
+
+    /// The host of a parsed URL by what it says alone: its name against the
+    /// allow-list, then, when the policy checks addresses, an address
+    /// literal against the address policy and a loopback name
+    /// ([`is_loopback_name`]) as the loopback address it names. Any other
+    /// name passes: what it resolves to is judged where it is resolved.
+    fn check_host_as_written(&self, url: &Url) -> Result<(), MediaConnectorError> {
+        let name = self.check_name(url)?;
+        if !self.checks_addresses() {
+            return Ok(());
+        }
+        match url.host() {
+            Some(Host::Domain(_)) if is_loopback_name(&name) => {
+                check_address(&name, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            }
+            Some(Host::Domain(_)) => Ok(()),
+            Some(Host::Ipv4(address)) => check_address(&name, IpAddr::V4(address)),
+            Some(Host::Ipv6(address)) => check_address(&name, IpAddr::V6(address)),
+            None => Err(MediaConnectorError::InvalidUrl(url.to_string())),
+        }
+    }
+}
+
+/// What follows the scheme and its colon when `text` opens with a scheme
+/// media is fetched over, in any case.
+fn after_fetched_scheme(text: &str) -> Option<&str> {
+    let (scheme, rest) = text.split_once(':')?;
+    FETCHED_SCHEMES
+        .iter()
+        .any(|fetched| scheme.eq_ignore_ascii_case(fetched))
+        .then_some(rest)
+}
+
+/// Whether URL readers split the authority of a URL differently, given what
+/// follows its scheme and colon: the `//` is missing (some readers find a
+/// host all the same, others none), or the authority (up to the next `/`,
+/// `?` or `#`) is empty (some readers skip the extra slash and find a host
+/// behind it, others none), holds a backslash (a path separator to some
+/// readers, part of the authority to others) or a second `@` (the user
+/// information ends at the first for some readers, at the last for others).
+fn authority_is_split_differently(after_scheme: &str) -> bool {
+    let Some(authority) = after_scheme.strip_prefix("//") else {
+        return true;
+    };
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.is_empty() || authority.contains('\\') || authority.matches('@').nth(1).is_some()
+}
+
+/// Whether `name` (lowercase) is `localhost` or a name under it: a name of
+/// the loopback interface whatever a resolver would answer (RFC 6761,
+/// section 6.3), with or without the root's trailing dot.
+fn is_loopback_name(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    name == "localhost" || name.ends_with(".localhost")
 }
 
 /// One address of `host` against the address policy, asked only when the
@@ -764,5 +868,145 @@ mod tests {
             matches!(&error, MediaConnectorError::UnresolvableHost { host: named, .. } if named == &host),
             "{error}"
         );
+    }
+
+    /// A URL that is handed on as written is judged by what its text says:
+    /// an address literal, in any spelling a URL reader takes for one, and a
+    /// loopback name, by the address policy. A name is not looked up.
+    #[test]
+    fn a_url_handed_on_is_judged_by_the_address_or_loopback_name_it_spells() {
+        let strict = MediaHostPolicy::new(None, false);
+        for (url, address, class) in [
+            ("http://127.0.0.1/a.png", "127.0.0.1", "loopback"),
+            ("HTTP://127.0.0.1:8080/a.png", "127.0.0.1", "loopback"),
+            ("https://10.1.2.3/a.png", "10.1.2.3", "private"),
+            (
+                "http://169.254.169.254/a.png",
+                "169.254.169.254",
+                "link-local",
+            ),
+            ("http://[::1]/a.png", "::1", "loopback"),
+            (
+                "http://[::ffff:10.1.2.3]/a.png",
+                "::ffff:10.1.2.3",
+                "private",
+            ),
+            // Spellings a URL reader takes for an IPv4 address.
+            ("http://2130706433/a.png", "127.0.0.1", "loopback"),
+            ("http://0x7f.1/a.png", "127.0.0.1", "loopback"),
+            ("http://0177.0.0.1/a.png", "127.0.0.1", "loopback"),
+            ("http://127.0.0.1./a.png", "127.0.0.1", "loopback"),
+            // User information is not the host.
+            (
+                "http://media.example@192.168.1.1/a.png",
+                "192.168.1.1",
+                "private",
+            ),
+            // The loopback names.
+            ("http://localhost/a.png", "127.0.0.1", "loopback"),
+            ("http://LocalHost.:8000/a.png", "127.0.0.1", "loopback"),
+            ("http://media.localhost/a.png", "127.0.0.1", "loopback"),
+            // What a URL reader drops before it reads: an ASCII tab or
+            // newline anywhere, a space or a control character in front.
+            ("http://127.0.\n0.1/a.png", "127.0.0.1", "loopback"),
+            ("ht\ttp://localhost/a.png", "127.0.0.1", "loopback"),
+            (" http://localhost/a.png", "127.0.0.1", "loopback"),
+        ] {
+            let verdict = strict.check_as_written(url);
+            assert!(
+                matches!(
+                    &verdict,
+                    Err(MediaConnectorError::DisallowedAddress { address: refused, class: named, .. })
+                        if (*refused, *named) == (ip(address), class)
+                ),
+                "{url:?}: {verdict:?}"
+            );
+        }
+        for url in [
+            "https://media.example/a.png",
+            "http://media.example:8080/a.png?size=1#top",
+            "http://localhost.media.example/a.png",
+            "http://media.example/a\\b.png",
+            "https://8.8.8.8/a.png",
+            "https://[2001:4860:4860::8888]/a.png",
+            // The well-formed neighbours of what is refused as unreadable:
+            // user information with its one `@`, an address literal in
+            // brackets with a port, a trailing tab or newline (dropped).
+            "https://user:secret@media.example/a.png",
+            "https://[2001:4860:4860::8888]:8443/a.png",
+            "https://media.example/a.png\t",
+            "https://media.example/a.png\n",
+            "https://media.example/a.png\r\n",
+            // Not a URL media is fetched over: no host to judge.
+            "data:image/png;base64,AAAA",
+            "file:///srv/media/a.png",
+            "a.png",
+            "",
+        ] {
+            assert!(strict.check_as_written(url).is_ok(), "{url:?}");
+        }
+    }
+
+    /// The verdict is on the host this side reads, so a URL whose authority
+    /// URL readers split differently, and one this side cannot parse, is
+    /// refused as invalid. The allow-list holds by name whatever the address
+    /// policy says; a policy with nothing to refuse reads nothing.
+    #[test]
+    fn a_url_handed_on_is_refused_when_its_host_is_not_read_one_way() {
+        let strict = MediaHostPolicy::new(None, false);
+        for url in [
+            "http://media.example\\@10.0.0.5/a.png",
+            "http://media.example\\a.png",
+            "http://a@b@media.example/a.png",
+            "http:/media.example/a.png",
+            "http:media.example/a.png",
+            "http:\\\\media.example/a.png",
+            "http://[fe80::1%25eth0]/a.png",
+            "http://media example/a.png",
+            "http://",
+            // An empty authority: a reader that skips the extra slash finds
+            // a host behind it, another finds none.
+            "http:///media.example/a.png",
+            // A zero-width joiner or non-joiner inside the host: a reader
+            // that drops it finds the address or the loopback name there;
+            // this side's reader refuses the host.
+            "http://127.0.0.\u{200c}1/a.png",
+            "http://local\u{200d}host/a.png",
+        ] {
+            assert!(
+                matches!(
+                    strict.check_as_written(url),
+                    Err(MediaConnectorError::InvalidUrl(echoed)) if echoed == url
+                ),
+                "{url:?}"
+            );
+        }
+
+        let listed = MediaHostPolicy::new(Some(vec!["media.example".to_string()]), true);
+        assert!(listed
+            .check_as_written("https://MEDIA.example/a.png")
+            .is_ok());
+        assert!(matches!(
+            listed.check_as_written("https://other.example/a.png"),
+            Err(MediaConnectorError::DisallowedDomain(host)) if host == "other.example"
+        ));
+        // Private hosts are allowed here: the list still holds, by name.
+        assert!(matches!(
+            listed.check_as_written("http://127.0.0.1/a.png"),
+            Err(MediaConnectorError::DisallowedDomain(host)) if host == "127.0.0.1"
+        ));
+        assert!(matches!(
+            listed.check_as_written("http://media.example\\@other.example/a.png"),
+            Err(MediaConnectorError::InvalidUrl(_))
+        ));
+
+        let open = MediaHostPolicy::new(None, true);
+        for url in [
+            "http://127.0.0.1/a.png",
+            "http://localhost/a.png",
+            "http://media.example\\@10.0.0.5/a.png",
+        ] {
+            assert!(open.check_as_written(url).is_ok(), "{url:?}");
+        }
     }
 }

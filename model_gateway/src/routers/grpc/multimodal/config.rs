@@ -568,6 +568,16 @@ impl MultimodalComponents {
             source = settings.processing.source.as_str(),
             "multimodal processing mode"
         );
+        if processing == MmProcessingMode::Worker {
+            // What the gateway says of a URL it hands on and does not fetch,
+            // and what it leaves to the worker that fetches it.
+            tracing::warn!(
+                "media references are forwarded to workers: the gateway holds a forwarded URL to \
+                 the media fetch policy by its text alone (the allow-list, an address literal, a \
+                 loopback name); the address a name resolves to and the target of a redirect are \
+                 judged by the worker that fetches, under the worker's own settings"
+            );
+        }
         // The switch is the way back to the two-pass write: say where it
         // stands and who set it, so a rollback that did not take is seen.
         tracing::info!(
