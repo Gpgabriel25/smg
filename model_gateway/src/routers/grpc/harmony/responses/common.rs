@@ -11,16 +11,14 @@ use openai_protocol::{
     },
 };
 use serde_json::to_string;
-use smg_mcp::{McpServerBinding, McpToolSession};
+use smg_mcp::{McpOrchestrator, McpServerBinding, McpToolSession};
 use tracing::debug;
 use uuid::Uuid;
 
 use super::execution::{convert_mcp_tools_to_response_tools, ToolResult};
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
-    grpc::common::responses::{
-        streaming::OutputItemKind, utils::resolve_function_identity, ResponsesContext,
-    },
+    grpc::common::responses::{streaming::OutputItemKind, utils::resolve_function_identity},
 };
 
 /// Record of a single MCP tool call execution
@@ -61,14 +59,18 @@ impl McpCallTracking {
 
 /// The request's MCP session, opened once for the loop; the session's MCP
 /// tools join the request's tool list, so the model sees them beside the
-/// user's own.
+/// user's own. A tool the request puts under `require_approval` is held,
+/// not run.
 pub(super) fn open_mcp_session<'a>(
-    ctx: &'a ResponsesContext,
+    orchestrator: &'a McpOrchestrator,
     mcp_servers: Vec<McpServerBinding>,
     request: &mut ResponsesRequest,
 ) -> McpToolSession<'a> {
     let session_request_id = format!("resp_{}", Uuid::now_v7());
-    let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
+    let mut session = McpToolSession::new(orchestrator, mcp_servers, &session_request_id);
+    if let Some(tools) = request.tools.as_deref() {
+        openai_bridge::configure_response_tools_approval(&mut session, tools);
+    }
     let mcp_tools = session.mcp_tools();
     if !mcp_tools.is_empty() {
         let mcp_response_tools = convert_mcp_tools_to_response_tools(&session);
@@ -347,6 +349,63 @@ mod namespace_tests {
                 serde_json::json!(["function", "lookup"]),
                 serde_json::json!(["mcp", serde_json::Value::Null]),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use std::borrow::Cow;
+
+    use serde_json::{from_value, json};
+    use smg_mcp::{McpConfig, Tool, ToolEntry, ToolExecutionInput};
+
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+
+    /// The session the loop opens holds a tool the request puts under
+    /// `require_approval: always`: the call returns the approval error, and
+    /// no server is asked for it.
+    #[tokio::test]
+    async fn the_loop_s_session_holds_a_tool_that_requires_approval() {
+        let orchestrator = McpOrchestrator::new(McpConfig::default())
+            .await
+            .expect("mcp orchestrator");
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "weather",
+                Tool::new(
+                    Cow::Borrowed("get_weather"),
+                    Cow::Borrowed("The weather of a city"),
+                    Arc::new(serde_json::Map::new()),
+                ),
+            ));
+        let mut request: ResponsesRequest = namespace_test_request();
+        request.tools = from_value(json!([
+            {"type": "mcp", "server_label": "weather", "server_url": "http://127.0.0.1:1/mcp", "require_approval": "always"},
+        ]))
+        .unwrap();
+        let bindings = vec![McpServerBinding {
+            label: "weather".to_string(),
+            server_key: "weather".to_string(),
+            allowed_tools: None,
+            list_error: None,
+        }];
+
+        let session = open_mcp_session(&orchestrator, bindings, &mut request);
+        let output = session
+            .execute_tool(ToolExecutionInput {
+                call_id: "call_held".to_string(),
+                tool_name: "get_weather".to_string(),
+                arguments: json!({"city": "Paris"}),
+            })
+            .await;
+
+        assert!(output.is_error, "{output:?}");
+        assert!(
+            format!("{output:?}").contains("requires approval"),
+            "the call was not held for its approval: {output:?}"
         );
     }
 }

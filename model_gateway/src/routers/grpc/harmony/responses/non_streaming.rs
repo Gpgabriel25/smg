@@ -145,7 +145,7 @@ async fn execute_with_mcp_loop(
     let mut original_tools = current_request.tools.clone();
     let user_function_names = collect_user_function_names(&current_request);
 
-    let session = open_mcp_session(ctx, mcp_servers, &mut current_request);
+    let session = open_mcp_session(&ctx.mcp_orchestrator, mcp_servers, &mut current_request);
 
     // Once the MCP loop has taken ownership of image_generation
     // dispatch, drop the hosted-tool descriptor so the harmony builder

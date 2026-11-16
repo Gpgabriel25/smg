@@ -982,3 +982,57 @@ async fn engine_error_never_dispatches_mcp_calls() {
         assert_eq!(mcp.call_count(), 0);
     }
 }
+
+/// The server call of `response` was held for its approval: the tool ran
+/// `ran` times (never), and every `mcp_call` item closed as failed with the
+/// approval error.
+fn assert_call_held(response: &Value, ran: usize) {
+    assert_eq!(ran, 0, "the tool ran without its approval: {response}");
+    let calls: Vec<&Value> = response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "mcp_call")
+        .collect();
+    assert!(
+        !calls.is_empty(),
+        "no server call in the output: {response}"
+    );
+    for call in calls {
+        assert_eq!(call["status"], "failed", "{response}");
+        assert!(
+            call["error"].to_string().contains("requires approval"),
+            "the call failed for another reason: {response}"
+        );
+    }
+}
+
+/// A server call under `require_approval: always` is held on a non-streamed
+/// request: the tool does not run, the call closes as failed with the
+/// approval error, and the model answers that.
+#[tokio::test]
+async fn a_call_that_waits_for_approval_does_not_run_on_a_response() {
+    let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+        .await
+        .unwrap();
+    let (response, _) = responses_result_with_final_answer(
+        json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"always"}]),
+        Some("<tool_call>\n{\"name\":\"brave_web_search\"}\n</tool_call>\n"), None, "completed", false, Some(1),
+    ).await;
+    mcp.stop().await;
+    assert_call_held(&response, mcp.call_count());
+}
+
+/// The streamed form of the case above.
+#[tokio::test]
+async fn a_call_that_waits_for_approval_does_not_run_on_a_stream() {
+    let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+        .await
+        .unwrap();
+    let (response, _) = responses_result_with_final_answer(
+        json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"always"}]),
+        Some("<tool_call>\n{\"name\":\"brave_web_search\"}\n</tool_call>\n"), None, "completed", true, Some(1),
+    ).await;
+    mcp.stop().await;
+    assert_call_held(&response, mcp.call_count());
+}
