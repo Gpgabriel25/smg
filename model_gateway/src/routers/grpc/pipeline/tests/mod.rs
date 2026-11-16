@@ -4021,6 +4021,44 @@ async fn a_non_streamed_request_to_a_silent_worker_is_the_504_at_the_request_tim
     assert_aborted_and_released(&scheduler, &worker).await;
 }
 
+/// Non-streamed requests that end at the request timeout are failures for
+/// their worker's circuit breaker, as streamed ones are: each request cut
+/// there is one failure sample for the worker that took it. The breaker's
+/// state is not read: the worker takes each call, which its breaker reads
+/// as a success, so whether the failures stand in a row is the order of
+/// those samples.
+#[tokio::test]
+async fn non_streamed_requests_cut_at_the_request_timeout_count_against_the_workers_breaker() {
+    let (pipeline, worker, _scheduler, components) =
+        silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+    let requests = CircuitBreakerConfig::default().failure_threshold;
+    let at_once = (0..requests).map(|_| {
+        pipeline.execute_completion(
+            completion(false),
+            None,
+            MODEL.to_string(),
+            Arc::clone(&components),
+            None,
+            None,
+            None,
+        )
+    });
+    for response in futures::future::join_all(at_once).await {
+        assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+    }
+    let breaker = worker
+        .as_any()
+        .downcast_ref::<crate::worker::BasicWorker>()
+        .expect("the stub's worker is a basic worker")
+        .circuit_breaker
+        .load();
+    assert_eq!(
+        breaker.total_failures(),
+        u64::from(requests),
+        "every request cut at the timeout is one failure for its worker's breaker"
+    );
+}
+
 /// A worker that never answers the call that opens the stream (the
 /// request never admitted, the servicer wedged before its first frame)
 /// is bounded by the same deadline: the call is dropped at the deadline,

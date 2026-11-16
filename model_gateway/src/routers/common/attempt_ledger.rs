@@ -63,6 +63,29 @@ pub(crate) fn mark_failed_side(response: &mut Response, worker: &dyn Worker) {
     });
 }
 
+/// Response extension: the attempt's worker stream failed after the worker
+/// took the call, and its circuit breaker has not been told. The stream's
+/// reader has no ledger; the dispatch loop charges the worker where it
+/// settles the attempt (see [`AttemptLedger::charge_pending`]).
+#[derive(Clone)]
+pub(crate) struct PendingCharge {
+    worker: Arc<dyn Worker>,
+    status_code: u16,
+}
+
+/// Mark `response` as the failure of `worker`'s stream, which its circuit
+/// breaker samples as `status_code` (see [`PendingCharge`]).
+pub(crate) fn mark_pending_charge(
+    response: &mut Response,
+    worker: &Arc<dyn Worker>,
+    status_code: u16,
+) {
+    response.extensions_mut().insert(PendingCharge {
+        worker: Arc::clone(worker),
+        status_code,
+    });
+}
+
 /// Whether `response` is a failure the answering worker must not see again
 /// for this request: the worker's own 500, the one retryable status a worker
 /// gives a request it processed and failed on. Its "not served now" statuses
@@ -121,6 +144,15 @@ impl AttemptLedger {
             ledger.charged.push(worker.url().to_string());
         }
         worker.record_outcome(status_code);
+    }
+
+    /// Charge the worker whose stream failed under the attempt
+    /// ([`PendingCharge`]), by the rule of [`Self::record_outcome`]: one
+    /// failure per request, however many attempts failed on it.
+    pub(crate) fn charge_pending(&self, response: &Response) {
+        if let Some(charge) = response.extensions().get::<PendingCharge>() {
+            self.record_outcome(charge.worker.as_ref(), charge.status_code);
+        }
     }
 
     /// The start of an attempt's dispatch: no call or read of an earlier
@@ -331,6 +363,22 @@ mod tests {
 
         // The next request is a new observation: the threshold counts requests.
         AttemptLedger::default().record_outcome(worker.as_ref(), 503);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn a_pending_charge_is_one_failure_per_request_per_worker() {
+        let worker = worker("grpc://w1:30000", 2);
+        let mut cut = (StatusCode::GATEWAY_TIMEOUT, "cut").into_response();
+        mark_pending_charge(&mut cut, &worker, 504);
+
+        let request = AttemptLedger::default();
+        for _ in 0..3 {
+            request.charge_pending(&cut);
+        }
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+
+        AttemptLedger::default().charge_pending(&cut);
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
     }
 
