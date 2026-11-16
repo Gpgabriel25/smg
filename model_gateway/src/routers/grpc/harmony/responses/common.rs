@@ -59,8 +59,8 @@ impl McpCallTracking {
 
 /// The request's MCP session, opened once for the loop; the session's MCP
 /// tools join the request's tool list, so the model sees them beside the
-/// user's own. A tool the request puts under `require_approval` is held,
-/// not run.
+/// user's own. A tool the request puts under `require_approval: "always"`
+/// is held, not run: its call returns the approval error.
 pub(super) fn open_mcp_session<'a>(
     orchestrator: &'a McpOrchestrator,
     mcp_servers: Vec<McpServerBinding>,

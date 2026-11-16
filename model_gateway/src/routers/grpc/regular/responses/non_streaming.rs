@@ -185,7 +185,7 @@ pub(super) async fn execute_tool_loop(
         .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::now_v7()));
 
     let mut session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
-    // A tool the request puts under approval is held, not run.
+    // A tool the request puts under `require_approval: "always"` is held, not run.
     if let Some(tools) = original_request.tools.as_deref() {
         openai_bridge::configure_response_tools_approval(&mut session, tools);
     }
