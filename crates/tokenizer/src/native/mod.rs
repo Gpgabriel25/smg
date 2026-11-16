@@ -3016,9 +3016,8 @@ impl NativeEncoder {
                 // ASCII.
                 let words = words || cache.unit_ascii || Self::opens_as_ascii(text);
                 // The probe compiles into the walk, as it does into the
-                // single-stage scanners' loop: as a closure of its own it
-                // was a call per piece, about ten instructions per token on
-                // every length (counted on new and on repeated text).
+                // single-stage scanners' loop: out of line it is a call per
+                // piece, about ten instructions per token on every length.
                 chain.pieces(
                     text,
                     words,
