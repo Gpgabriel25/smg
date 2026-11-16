@@ -322,6 +322,10 @@ name = "epd"
 harness = false
 
 [[bench]]
+name = "encode_pair"
+harness = false
+
+[[bench]]
 name = "contention"
 harness = false
 
