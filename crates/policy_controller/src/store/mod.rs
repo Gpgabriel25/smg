@@ -101,8 +101,8 @@ pub use workers::{
     Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 pub use world::{
-    Ask, Built, OutsideLists, PairBuffers, PoolView, StaleGeneration, ViewBuffers, World,
-    PUBLISH_WINDOW,
+    Ask, Built, EncodePairBuffers, OutsideLists, PairBuffers, PoolView, StaleGeneration,
+    ViewBuffers, World, PUBLISH_WINDOW,
 };
 
 /// The verified identity of a gateway: the fingerprint of the subject its
