@@ -2991,7 +2991,7 @@ impl NativeEncoder {
         // One walk per unit. A single-stage encoder hands the unit to
         // `encode_single_stage`, out of line, where the scanner's own loop
         // probes each piece in place (no recursive walk); the chain's walk
-        // does the same, its pieces offsets into the unit and the probe
+        // probes its own pieces, offsets into the unit, with the probe
         // compiled into the walk; any other shape walks, a lone `Removed`
         // stage among them (its matches are no pieces: the scanner loop
         // stays the loop of a stage whose matches are).
@@ -3015,9 +3015,11 @@ impl NativeEncoder {
                 // the head is counted only for a unit with a byte beyond
                 // ASCII.
                 let words = words || cache.unit_ascii || Self::opens_as_ascii(text);
-                // The probe compiles into the walk, as it does into the
-                // single-stage scanners' loop: out of line it is a call per
-                // piece, about ten instructions per token on every length.
+                // The probe compiles into the walk at the template's match,
+                // where nearly every piece ends, as it does into the
+                // single-stage scanners' loop; the walk's other ends call it
+                // through `Scanner::aside`. Out of line at every end it is a
+                // call per piece, nine to eighteen instructions per token.
                 chain.pieces(
                     text,
                     words,

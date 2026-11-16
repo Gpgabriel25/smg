@@ -290,9 +290,9 @@ impl Scanner {
     }
 
     /// A piece end off the walk's main path (a digit group or a run taken
-    /// whole, the text between two matches): the callback out of line, so
-    /// that a callback compiled into the walk stands at the template's
-    /// match alone.
+    /// whole, the text before a match or after the last one): the callback
+    /// out of line, so that a callback compiled into the walk stands at the
+    /// template's match alone.
     #[inline(never)]
     fn aside<F: FnMut(usize, usize)>(f: &mut F, start: usize, end: usize) {
         f(start, end);
