@@ -2990,9 +2990,9 @@ impl NativeEncoder {
         cache.unit_ascii = text.is_ascii();
         // One walk per unit. A single-stage encoder hands the unit to
         // `encode_single_stage`, out of line, where the scanner's own loop
-        // probes each piece in place (no recursive walk); the chain hands
-        // its pieces, as offsets into the unit, to the same probe through
-        // its static callback; any other shape walks, a lone `Removed`
+        // probes each piece in place (no recursive walk); the chain's walk
+        // does the same, its pieces offsets into the unit and the probe
+        // compiled into the walk; any other shape walks, a lone `Removed`
         // stage among them (its matches are no pieces: the scanner loop
         // stays the loop of a stage whose matches are).
         match (&self.chain, self.stages.as_slice(), self.mapped_from) {
@@ -3015,13 +3015,22 @@ impl NativeEncoder {
                 // the head is counted only for a unit with a byte beyond
                 // ASCII.
                 let words = words || cache.unit_ascii || Self::opens_as_ascii(text);
-                chain.pieces(text, words, &mut |start, end| {
-                    if let Err(declined) =
-                        self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
-                    {
-                        fallback = Some(declined);
-                    }
-                });
+                // The probe compiles into the walk, as it does into the
+                // single-stage scanners' loop: as a closure of its own it
+                // was a call per piece, about ten instructions per token on
+                // every length (counted on new and on repeated text).
+                chain.pieces(
+                    text,
+                    words,
+                    #[inline(always)]
+                    |start, end| {
+                        if let Err(declined) =
+                            self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
+                        {
+                            fallback = Some(declined);
+                        }
+                    },
+                );
             }
             (None, [stage], None)
                 if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>

@@ -278,12 +278,14 @@ impl Scanner {
     /// leave no character out. `words` says the run loops take their word
     /// scans (a long input, or a unit that opens as ASCII text; see the
     /// encoder's `WORD_SCAN_MIN_BYTES`): the walk is compiled both ways and
-    /// the choice is made once per unit.
-    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, words: bool, f: &mut F) {
+    /// the choice is made once per unit. `f` is taken by value, so that a
+    /// caller's closure can ask to be compiled into the walk
+    /// (`#[inline(always)]` on the closure, as the encoder's probe does).
+    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, words: bool, mut f: F) {
         if words {
-            self.pieces_as::<true, F>(text, f);
+            self.pieces_as::<true, F>(text, &mut f);
         } else {
-            self.pieces_as::<false, F>(text, f);
+            self.pieces_as::<false, F>(text, &mut f);
         }
     }
 
