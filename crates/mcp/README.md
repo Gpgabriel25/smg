@@ -509,7 +509,7 @@ Router code should use `McpToolSession` so exposed tool names are collision-safe
 | `PolicyOnly` | Batch processing, Chat API | Auto-decide via PolicyEngine |
 | `Interactive` | Responses API | Return approval request to client |
 
-On every Responses path a tool that requires approval is not run without it. The approval request reaches the client on a non-streamed request through the OpenAI-compatible HTTP router; on the other paths the call closes as failed with the approval error.
+On every Responses path a tool that requires approval is not run without it. The approval request reaches the client on a non-streamed request through the OpenAI-compatible HTTP router; on the other paths the call fails with the approval error. A Harmony stream sends a server call's item events before the call is run, so those events do not show the failure; the final response does.
 
 ### Trust Levels
 
