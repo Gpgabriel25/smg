@@ -4046,16 +4046,104 @@ async fn non_streamed_requests_cut_at_the_request_timeout_count_against_the_work
     for response in futures::future::join_all(at_once).await {
         assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
     }
-    let breaker = worker
+    assert_eq!(
+        breaker_failures(worker.as_ref()),
+        u64::from(requests),
+        "every request cut at the timeout is one failure for its worker's breaker"
+    );
+}
+
+/// The failures `worker`'s circuit breaker has counted.
+fn breaker_failures(worker: &dyn Worker) -> u64 {
+    worker
         .as_any()
         .downcast_ref::<crate::worker::BasicWorker>()
         .expect("the stub's worker is a basic worker")
         .circuit_breaker
-        .load();
+        .load()
+        .total_failures()
+}
+
+/// The engine's own report on a non-streamed request is no failure for its
+/// worker's circuit breaker: the request is replayed on that worker, and
+/// the breaker has counted nothing when the answer is the engine's 500.
+#[tokio::test]
+async fn an_engines_own_report_on_a_non_streamed_request_is_no_failure_for_the_workers_breaker() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let port = spawn_stub(GatedScheduler {
+        fail_engine_report: true,
+        seen_request_ids: Arc::clone(&seen),
+        ..Default::default()
+    })
+    .await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+    let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+    let components = components(worker_registry).await;
+
+    let response = run_completion(pipeline, components, &fast_retry_config(2)).await;
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        calls_seen(&seen) >= 2,
+        "the engine's own report is replayed on the worker"
+    );
     assert_eq!(
-        breaker.total_failures(),
-        u64::from(requests),
-        "every request cut at the timeout is one failure for its worker's breaker"
+        breaker_failures(worker.as_ref()),
+        0,
+        "the engine's own report is no failure for its worker's breaker"
+    );
+}
+
+/// The decode side of a prefill and decode pair that is cut at the request
+/// timeout under a non-streamed answer is one failure for the decode
+/// worker's circuit breaker, and none for the prefill worker's, whose side
+/// completed.
+#[tokio::test]
+async fn a_decode_side_cut_at_the_request_timeout_is_a_failure_for_the_decode_workers_breaker() {
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler {
+        frame_gap: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    })
+    .await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+    let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_request_timeout(REQUEST_TIMEOUT);
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
+        .expect("completion pipeline");
+    let components = components(Arc::clone(&worker_registry)).await;
+
+    let response = pipeline
+        .execute_completion(
+            completion(false),
+            None,
+            MODEL.to_string(),
+            components,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        breaker_failures(decode.as_ref()),
+        1,
+        "the cut is one failure for the decode worker's breaker"
+    );
+    assert_eq!(
+        breaker_failures(prefill.as_ref()),
+        0,
+        "the prefill side completed"
     );
 }
 
