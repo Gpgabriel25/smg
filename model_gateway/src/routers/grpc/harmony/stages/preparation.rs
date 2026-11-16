@@ -134,12 +134,32 @@ impl HarmonyPreparationStage {
 
         // Step 3: Build via Harmony
         let build_output = self.builder.build_from_chat(&body_ref).map_err(|e| {
-            error!(
-                function = "prepare_chat",
-                error = %e,
-                "Harmony build failed for chat request"
-            );
-            error::bad_request("harmony_build_failed", format!("Harmony build failed: {e}"))
+            // Only a refusal typed as the request's own (a content part
+            // Harmony has no form for) is the client's to fix: one WARN with
+            // the cause, the answer marked reported. An encoding that does
+            // not load or a conversation that does not encode keeps ERROR
+            // and stays unmarked.
+            let refused = e.is_refusal();
+            if refused {
+                warn!(
+                    function = "prepare_chat",
+                    error = %e,
+                    "Harmony build failed for chat request"
+                );
+            } else {
+                error!(
+                    function = "prepare_chat",
+                    error = %e,
+                    "Harmony build failed for chat request"
+                );
+            }
+            let answer =
+                error::bad_request("harmony_build_failed", format!("Harmony build failed: {e}"));
+            if refused {
+                utils::reported(answer)
+            } else {
+                answer
+            }
         })?;
 
         // Step 4: Store results
@@ -212,12 +232,32 @@ impl HarmonyPreparationStage {
 
         // Step 3: Build via Harmony from responses API request
         let build_output = self.builder.build_from_responses(request).map_err(|e| {
-            error!(
-                function = "prepare_responses",
-                error = %e,
-                "Harmony build failed for responses request"
-            );
-            error::bad_request("harmony_build_failed", format!("Harmony build failed: {e}"))
+            // As for a chat request: only a refusal typed as the request's
+            // own (an input item or a content part Harmony has no form for)
+            // is one WARN and a marked answer; an encoding that does not
+            // load or a conversation that does not encode keeps ERROR and
+            // stays unmarked.
+            let refused = e.is_refusal();
+            if refused {
+                warn!(
+                    function = "prepare_responses",
+                    error = %e,
+                    "Harmony build failed for responses request"
+                );
+            } else {
+                error!(
+                    function = "prepare_responses",
+                    error = %e,
+                    "Harmony build failed for responses request"
+                );
+            }
+            let answer =
+                error::bad_request("harmony_build_failed", format!("Harmony build failed: {e}"));
+            if refused {
+                utils::reported(answer)
+            } else {
+                answer
+            }
         })?;
 
         // Step 4: Store results with constraint

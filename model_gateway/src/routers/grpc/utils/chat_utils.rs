@@ -1190,16 +1190,18 @@ pub fn request_as_rendered(
     }
 }
 
-/// Why a conversation did not become a prompt.
+/// Why a request's conversation or input did not become a prompt.
 ///
 /// [`Self::Refused`] is a cause the request itself brings and its client can
 /// fix: media for a template with no placeholder for it, a block or a document
 /// source the route does not take, a response format the renderer does not
 /// take with the request's other fields, a conversation the model's template
-/// rejects through its own `raise_exception`. A stage writes one WARN for it
-/// and marks its answer reported. Every other cause is [`Self::Failed`], which
-/// is also what a bare message converts into: a failure nobody typed as the
-/// request's is the deployment's, and the stage keeps its ERROR line for it.
+/// rejects through its own `raise_exception`, a part or an input item with no
+/// Harmony form, a generate input the route does not take. A stage writes one
+/// WARN for it and marks its answer reported. Every other cause is
+/// [`Self::Failed`], which is also what a bare message converts into: a
+/// failure nobody typed as the request's is the deployment's, and the stage
+/// keeps its ERROR line for it.
 #[derive(Debug)]
 pub enum PromptError {
     Refused(String),

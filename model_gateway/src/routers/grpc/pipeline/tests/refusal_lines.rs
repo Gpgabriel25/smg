@@ -5,8 +5,9 @@
 //! writes that WARN only for a cause typed as the request's own. Every other failure keeps an
 //! ERROR line: the stage's own where it answers 400 for a fault of the deployment (a model
 //! configuration that does not load, a vocabulary without the placeholder token, a tokenizer
-//! with no chat template), the pipeline's too in the server's class.
+//! with no chat template or whose encode fails), the pipeline's too in the server's class.
 
+use llm_tokenizer::traits::{Encoder, Encoding, SpecialTokens};
 use tracing::Level;
 
 use super::*;
@@ -314,6 +315,185 @@ async fn a_responses_input_the_conversion_refuses_is_one_warn_and_marked() {
         [(
             Level::WARN,
             "Failed to convert ResponsesRequest to ChatCompletionRequest".to_string()
+        )]
+    );
+}
+
+/// The answer of the chat door of [`both_doors_over`], which is the generate route's pipeline
+/// too, to the generate request `body`, with the lines at WARN or above the request wrote. The
+/// preparation stage resolves the input before any worker is chosen, so none is registered.
+async fn generate_answer_over(
+    tokenizer: Arc<dyn Tokenizer>,
+    body: serde_json::Value,
+) -> (Response, Vec<(Level, String)>) {
+    let (pipeline, _, components) = both_doors_over(tokenizer).await;
+    let request: Arc<GenerateRequest> =
+        Arc::new(serde_json::from_value(body).expect("generate request"));
+    let lines = LinesAtWarnOrAbove::default();
+    let _subscriber = test_subscriber(lines.clone());
+
+    let response = pipeline
+        .execute_generate(
+            request,
+            None,
+            MODEL.to_string(),
+            components,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    (response, lines.lines())
+}
+
+/// A generate input only the request can put right (a batch of id lists, a negative id, an id
+/// that is no token of the model, neither a text nor ids) is refused with one WARN that carries
+/// the cause, the answer marked, no ERROR.
+#[tokio::test]
+async fn a_generate_input_the_request_gets_wrong_is_one_warn_and_marked() {
+    // Past the mock's vocabulary and none of its added tokens; no worker reports a table.
+    let unknown = MockTokenizer::new().vocab_size() as u32 + 7;
+    let inputs = [
+        serde_json::json!({"model": MODEL, "input_ids": [[1, 2], [3]]}),
+        serde_json::json!({"model": MODEL, "input_ids": [1, -2, 3]}),
+        serde_json::json!({"model": MODEL, "input_ids": [1, unknown]}),
+        serde_json::json!({"model": MODEL}),
+    ];
+    for body in inputs {
+        let input = body.to_string();
+        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+
+        let (response, lines) = generate_answer_over(tokenizer, body).await;
+
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST, "{input}");
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "resolve_input_failed",
+            "{input}"
+        );
+        assert!(marked(&response), "{input}");
+        assert_eq!(
+            lines,
+            [(Level::WARN, "Failed to resolve generate input".to_string())],
+            "{input}"
+        );
+    }
+}
+
+/// The mock tokenizer with an encode that fails for every text: the tokenizer's fault, whatever
+/// the request holds.
+struct FailingEncode(MockTokenizer);
+
+impl Encoder for FailingEncode {
+    fn encode(&self, _input: &str, _add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        anyhow::bail!("the vocabulary could not be read")
+    }
+
+    fn encode_batch(
+        &self,
+        _inputs: &[&str],
+        _add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        anyhow::bail!("the vocabulary could not be read")
+    }
+}
+
+impl Decoder for FailingEncode {
+    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        self.0.decode(token_ids, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for FailingEncode {
+    fn vocab_size(&self) -> usize {
+        self.0.vocab_size()
+    }
+
+    fn get_special_tokens(&self) -> &SpecialTokens {
+        self.0.get_special_tokens()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.0.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.0.id_to_token(id)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A tokenizer whose encode fails fails every text prompt, whatever the request holds: the
+/// deployment's to fix, though its answer is a 400. The stage's ERROR line stays and the answer
+/// is unmarked.
+#[tokio::test]
+async fn a_generate_text_the_tokenizer_cannot_encode_keeps_the_stages_error_line() {
+    let tokenizer = Arc::new(FailingEncode(MockTokenizer::new())) as Arc<dyn Tokenizer>;
+
+    let (response, lines) =
+        generate_answer_over(tokenizer, serde_json::json!({"model": MODEL, "text": "hi"})).await;
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error::extract_error_code_from_response(&response),
+        "resolve_input_failed"
+    );
+    assert!(!marked(&response));
+    assert_eq!(
+        lines,
+        [(Level::ERROR, "Failed to resolve generate input".to_string())]
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the answer's body");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("Tokenization failed: the vocabulary could not be read"),
+        "{body}"
+    );
+}
+
+/// A content part the Harmony path has no form for (an image) is the request's to fix: the
+/// Harmony preparation writes one WARN with the cause and marks the answer, and neither it nor
+/// the pipeline writes an ERROR. The build refuses the part before it loads its encoding, so the
+/// test reads no vocabulary.
+#[tokio::test]
+async fn a_content_part_the_harmony_build_refuses_is_one_warn_and_marked() {
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let components = shared_components(
+        Arc::new(TokenizerRegistry::new()),
+        worker_registry.clone(),
+        false,
+    );
+    let deps = PipelineDeps::pair(
+        worker_registry,
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline =
+        RequestPipeline::build(Endpoint::Harmony, Mode::Regular, &deps).expect("harmony pipeline");
+    let lines = LinesAtWarnOrAbove::default();
+    let _subscriber = test_subscriber(lines.clone());
+
+    let response = chat_response(&pipeline, components, one_pixel_image_chat()).await;
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error::extract_error_code_from_response(&response),
+        "harmony_build_failed"
+    );
+    assert!(marked(&response));
+    assert_eq!(
+        lines.lines(),
+        [(
+            Level::WARN,
+            "Harmony build failed for chat request".to_string()
         )]
     );
 }

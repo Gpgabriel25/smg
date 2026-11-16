@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::InputIds, generate::GenerateRequest};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     routers::{
@@ -13,7 +13,7 @@ use crate::{
         grpc::{
             context::{PreparationOutput, RequestContext},
             regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
-            utils,
+            utils::{self, PromptError},
         },
     },
     worker::WorkerRegistry,
@@ -75,9 +75,23 @@ impl GeneratePreparationStage {
             .await
         {
             Ok(res) => res,
-            Err(msg) => {
-                error!(function = FUNCTION, error = %msg, "Failed to resolve generate input");
-                return Err(error::bad_request("resolve_input_failed", msg));
+            Err(e) => {
+                // Only an input typed as the request's own mistake is the
+                // client's to fix: one WARN with the cause, the answer marked
+                // reported. A text the tokenizer could not encode keeps ERROR
+                // and stays unmarked.
+                let refused = e.is_refusal();
+                if refused {
+                    warn!(function = FUNCTION, error = %e, "Failed to resolve generate input");
+                } else {
+                    error!(function = FUNCTION, error = %e, "Failed to resolve generate input");
+                }
+                let answer = error::bad_request("resolve_input_failed", String::from(e));
+                return Err(if refused {
+                    utils::reported(answer)
+                } else {
+                    answer
+                });
             }
         };
 
@@ -103,13 +117,20 @@ impl GeneratePreparationStage {
         Ok(())
     }
 
+    /// The request's prompt as token ids, with its text when it came as text.
+    ///
+    /// An input only the request can put right is [`PromptError::Refused`]:
+    /// a batch of id lists, a negative id, an id that is no token of the
+    /// model, neither a text nor ids. A text the tokenizer could not encode
+    /// is [`PromptError::Failed`]: the failure is the tokenizer's, and the
+    /// stage keeps its ERROR line for it.
     async fn resolve_generate_input(
         &self,
         request: &GenerateRequest,
         tokenizer: &Arc<dyn Tokenizer>,
         worker_registry: &WorkerRegistry,
         model_id: &str,
-    ) -> Result<(Option<String>, Vec<u32>), String> {
+    ) -> Result<(Option<String>, Vec<u32>), PromptError> {
         // The engine's order: the ids before the text, so a body that carries
         // both is served from the ids as the engine serves it (the text rode
         // along for the client's own reading); a text-first read dropped the
@@ -121,15 +142,18 @@ impl GeneratePreparationStage {
                         .iter()
                         .map(|&id| u32::try_from(id))
                         .collect::<Result<Vec<u32>, _>>()
-                        .map_err(|_| "input_ids must be non-negative".to_string())?;
+                        .map_err(|_| {
+                            PromptError::Refused("input_ids must be non-negative".to_string())
+                        })?;
                     reject_unknown_token_id(tokenizer.as_ref(), &converted, "input_ids", || {
                         reported_embedding_rows(worker_registry, model_id)
-                    })?;
+                    })
+                    .map_err(PromptError::Refused)?;
                     Ok((None, converted))
                 }
-                InputIds::Batch(_) => {
-                    Err("Batch input_ids are not supported over gRPC generate yet".to_string())
-                }
+                InputIds::Batch(_) => Err(PromptError::Refused(
+                    "Batch input_ids are not supported over gRPC generate yet".to_string(),
+                )),
             };
         }
 
@@ -137,10 +161,13 @@ impl GeneratePreparationStage {
             return self
                 .tokenize_single_text(tokenizer, text)
                 .await
-                .map(|(original, ids)| (Some(original), ids));
+                .map(|(original, ids)| (Some(original), ids))
+                .map_err(PromptError::Failed);
         }
 
-        Err("Either `text` or `input_ids` must be provided".to_string())
+        Err(PromptError::Refused(
+            "Either `text` or `input_ids` must be provided".to_string(),
+        ))
     }
 
     async fn tokenize_single_text(

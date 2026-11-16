@@ -31,7 +31,7 @@ use super::types::HarmonyBuildOutput;
 use crate::routers::grpc::{
     common::responses::{history::hosted_call_result, utils::extract_tools_from_response_tools},
     proto_wrapper::ProtoOutputLogProbs,
-    utils,
+    utils::{self, PromptError},
 };
 
 /// Global Harmony encoding (lazy-initialized)
@@ -452,14 +452,22 @@ impl HarmonyBuilder {
     /// # Returns
     ///
     /// HarmonyBuildOutput containing input_ids, stop_token_ids and selection_text
+    ///
+    /// # Errors
+    ///
+    /// [`PromptError::Refused`] for a content part of the request that Harmony
+    /// has no form for; [`PromptError::Failed`] when the encoding does not
+    /// load or the conversation does not encode.
     pub fn build_from_chat(
         &self,
         request: &ChatCompletionRequest,
-    ) -> Result<HarmonyBuildOutput, String> {
+    ) -> Result<HarmonyBuildOutput, PromptError> {
         // Harmony takes media in no role: its own whole-request refusal speaks before
-        // the shared door names a role's rule.
-        reject_chat_media(&request.messages)?;
-        utils::validate_chat_content_parts(&request.messages)?;
+        // the shared door names a role's rule. Both refuse a part the request
+        // itself carries. Every later error is a bare message: a failure, not
+        // a refusal.
+        reject_chat_media(&request.messages).map_err(PromptError::Refused)?;
+        utils::validate_chat_content_parts(&request.messages).map_err(PromptError::Refused)?;
         let encoding = try_harmony_encoding()?;
 
         let mut all_messages = Vec::new();
@@ -479,7 +487,7 @@ impl HarmonyBuilder {
         let mut user_messages = self.convert_chat_messages(messages);
         all_messages.append(&mut user_messages);
 
-        self.encode_prompt(encoding, all_messages)
+        Ok(self.encode_prompt(encoding, all_messages)?)
     }
 
     /// Build Harmony request from Responses request
@@ -491,12 +499,22 @@ impl HarmonyBuilder {
     /// # Returns
     ///
     /// HarmonyBuildOutput containing input_ids, stop_token_ids and selection_text
+    ///
+    /// # Errors
+    ///
+    /// [`PromptError::Refused`] for an input item, a content part or a
+    /// function output of the request that Harmony has no form for;
+    /// [`PromptError::Failed`] when the encoding does not load or the
+    /// conversation does not encode.
     pub fn build_from_responses(
         &self,
         request: &ResponsesRequest,
-    ) -> Result<HarmonyBuildOutput, String> {
+    ) -> Result<HarmonyBuildOutput, PromptError> {
         let encoding = try_harmony_encoding()?;
-        let all_messages = self.construct_input_messages_with_harmony(request)?;
+        // The conversion fails only on what the request's own input holds.
+        let all_messages = self
+            .construct_input_messages_with_harmony(request)
+            .map_err(PromptError::Refused)?;
         let output = self.encode_prompt(encoding, all_messages)?;
 
         // What the model receives, decoded back for the trace lines alone:
@@ -689,6 +707,11 @@ impl HarmonyBuilder {
     /// # Arguments
     /// * `request` - The ResponsesRequest
     /// * `prev_response` - Optional previous response to continue from
+    ///
+    /// # Errors
+    /// Only what the input itself holds fails the conversion: an item kind or
+    /// a content part with no Harmony form, a function output with no call.
+    /// `build_from_responses` types every error here as the request's refusal.
     fn construct_input_messages_with_harmony(
         &self,
         request: &ResponsesRequest,
@@ -1457,6 +1480,8 @@ mod tests {
         }))
         .unwrap();
         let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert!(error.is_refusal(), "{error:?}");
+        let error = error.to_string();
         assert!(error.contains("vendor_media"));
         assert!(error.contains("gRPC"));
     }
@@ -1479,8 +1504,9 @@ mod tests {
         }))
         .unwrap();
         let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert!(error.is_refusal(), "{error:?}");
         assert_eq!(
-            error,
+            error.to_string(),
             "Harmony does not support image content parts; use the regular multimodal path"
         );
     }
@@ -1489,7 +1515,7 @@ mod tests {
     /// form in a Harmony prompt: the build refuses it by name, as it refuses
     /// chat audio, instead of rendering the turn without it; a message item,
     /// a simple input message and a function output (the tool message's text)
-    /// alike.
+    /// alike. Each is typed as the request's own refusal.
     #[test]
     fn build_from_responses_refuses_image_and_file_parts() {
         let builder = HarmonyBuilder::new();
@@ -1521,7 +1547,8 @@ mod tests {
                 let error = builder
                     .build_from_responses(&request)
                     .expect_err("a media part is refused");
-                assert!(error.contains(name), "{error}");
+                assert!(error.is_refusal(), "{error:?}");
+                assert!(error.to_string().contains(name), "{error}");
             }
         }
     }
@@ -1581,6 +1608,8 @@ mod tests {
             let error = HarmonyBuilder::new()
                 .build_from_chat(&request)
                 .expect_err("a media part the Harmony path has no form for is refused");
+            assert!(error.is_refusal(), "{kind}: {error:?}");
+            let error = error.to_string();
             assert!(
                 error.contains(&format!("{kind} content parts")),
                 "{kind}: the refusal names the part: {error}"
