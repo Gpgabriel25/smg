@@ -289,6 +289,15 @@ impl Scanner {
         }
     }
 
+    /// A piece end off the walk's main path (a digit group or a run taken
+    /// whole, the text between two matches): the callback out of line, so
+    /// that a callback compiled into the walk stands at the template's
+    /// match alone.
+    #[inline(never)]
+    fn aside<F: FnMut(usize, usize)>(f: &mut F, start: usize, end: usize) {
+        f(start, end);
+    }
+
     /// [`Self::pieces`] with the word scans on or off.
     fn pieces_as<const WORDS: bool, F: FnMut(usize, usize)>(&self, text: &str, f: &mut F) {
         let mut pos = 0;
@@ -316,7 +325,7 @@ impl Scanner {
                     // class or opens a match of the template: the group is
                     // one piece, and the two stages' reads of it are left
                     // out.
-                    f(pos, end);
+                    Self::aside(f, pos, end);
                 } else {
                     self.group_pieces::<WORDS, F>(text, pos, end, f);
                 }
@@ -339,7 +348,7 @@ impl Scanner {
                     // first opens no punctuation match: the template's
                     // letter run takes the run whole, so the run is one
                     // piece and the template's read of it is left out.
-                    f(pos, end);
+                    Self::aside(f, pos, end);
                     end
                 } else {
                     self.template_pieces::<WORDS, F>(text, pos, end, 0, f)
@@ -405,7 +414,7 @@ impl Scanner {
             match self.template_match::<WORDS>(piece, pos, c, len, stop) {
                 Some(matched) => {
                     if gap < pos {
-                        f(start + gap, start + pos);
+                        Self::aside(f, start + gap, start + pos);
                     }
                     f(start + pos, start + matched);
                     pos = matched;
@@ -415,7 +424,7 @@ impl Scanner {
             }
         }
         if gap < pos {
-            f(start + gap, start + pos);
+            Self::aside(f, start + gap, start + pos);
         }
         start + pos
     }
