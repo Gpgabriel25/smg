@@ -1005,8 +1005,10 @@ pub struct TrackedStream {
     /// the worker is producing for (see [`Worker::output_silence`]).
     output: Option<OutputTicket>,
     /// Whether the worker's circuit-breaker success for this dispatch is
-    /// still to be sampled, at the stream's first response (a disaggregated
-    /// decode side: see [`ProtoStream::tracked_decode_side`]).
+    /// still to be sampled, at the stream's first response (a single
+    /// dispatch's stream and a disaggregated decode side: see
+    /// [`ProtoStream::tracked_single_booked`] and
+    /// [`ProtoStream::tracked_decode_side`]).
     samples_success: bool,
     /// A response (or the stream's end) pulled ahead of the stream's reader
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
@@ -1980,6 +1982,28 @@ impl ProtoStream {
             samples_success: false,
             replay: None,
         }))
+    }
+
+    /// [`Self::tracked_booked`] for the one worker of a single dispatch: the
+    /// worker's circuit-breaker success for the dispatch is sampled at the
+    /// stream's first response rather than when the call returned its
+    /// stream, as a decode side's is (see [`Self::tracked_decode_side`]). A
+    /// worker that took the call has answered nothing yet: one that takes
+    /// calls and stalls, or whose streams fail before a response, is one
+    /// failure a request and not a success and then a failure, which reset
+    /// the breaker's streak on every request. A stream that ends with
+    /// nothing on it earns no success either.
+    #[must_use]
+    pub(crate) fn tracked_single_booked(
+        self,
+        worker: Arc<dyn Worker>,
+        booking: DispatchBooking,
+    ) -> Self {
+        let mut stream = self.tracked_booked(worker, booking);
+        if let Self::Tracked(tracked) = &mut stream {
+            tracked.samples_success = true;
+        }
+        stream
     }
 
     /// Track this stream as the prefill side of a disaggregated dispatch to

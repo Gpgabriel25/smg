@@ -4023,10 +4023,9 @@ async fn a_non_streamed_request_to_a_silent_worker_is_the_504_at_the_request_tim
 
 /// Non-streamed requests that end at the request timeout are failures for
 /// their worker's circuit breaker, as streamed ones are: each request cut
-/// there is one failure sample for the worker that took it. The breaker's
-/// state is not read: the worker takes each call, which its breaker reads
-/// as a success, so whether the failures stand in a row is the order of
-/// those samples.
+/// there is one failure sample for the worker that took it. The requests
+/// are in flight at once here; the next test sends them one after another
+/// and reads the breaker's state.
 #[tokio::test]
 async fn non_streamed_requests_cut_at_the_request_timeout_count_against_the_workers_breaker() {
     let (pipeline, worker, _scheduler, components) =
@@ -4054,6 +4053,42 @@ async fn non_streamed_requests_cut_at_the_request_timeout_count_against_the_work
         u64::from(requests),
         "every request cut at the timeout is one failure for its worker's breaker"
     );
+}
+
+/// A worker that takes every call and answers nothing is taken out at its
+/// breaker's threshold of requests when they come one after another too,
+/// streamed or not: the call it took is no success for it, so the failed
+/// requests are failures in a row.
+#[tokio::test]
+async fn requests_one_after_another_to_a_silent_worker_open_its_breaker() {
+    for stream in [false, true] {
+        let (pipeline, worker, _scheduler, components) =
+            silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+        for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+            tokio::time::timeout(CASE_CAP, async {
+                let response = pipeline
+                    .execute_completion(
+                        completion(stream),
+                        None,
+                        MODEL.to_string(),
+                        Arc::clone(&components),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                // A streamed answer fails inside its body: it is read to its end.
+                let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+            })
+            .await
+            .expect("the request timeout answers: without it the gateway waits on the silent worker as long as the client does");
+        }
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "stream: {stream}"
+        );
+    }
 }
 
 /// The failures `worker`'s circuit breaker has counted.

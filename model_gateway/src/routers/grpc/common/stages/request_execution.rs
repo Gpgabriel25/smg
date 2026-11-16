@@ -1224,7 +1224,10 @@ async fn execute_single(
         dispatched_at,
     )
     .await;
-    if let Some(status) = result.breaker_status() {
+    // A call that failed is the worker's failure here. A call the worker
+    // took is no success yet: the stream samples it at its first response
+    // (see `ProtoStream::tracked_single_booked`).
+    if let Some(status) = result.as_ref().err().and_then(|e| e.breaker_status()) {
         workers.record_outcome(ledger, status);
     }
 
@@ -1275,7 +1278,7 @@ async fn dispatch_single_booked(
     };
     let booking = DispatchBooking::book_at(worker, prompt_tokens, streaming, dispatched_at);
     let stream = call.await?;
-    Ok(stream.tracked_booked(Arc::clone(worker), booking))
+    Ok(stream.tracked_single_booked(Arc::clone(worker), booking))
 }
 
 /// Client answer for a request the worker did not start; an engine rejection (4xx) is not a fault.
