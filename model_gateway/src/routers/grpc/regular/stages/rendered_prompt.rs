@@ -10,6 +10,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use llm_multimodal::Modality;
 use llm_tokenizer::traits::{PromptEncoding, Tokenizer};
+use openai_protocol::worker::MmProcessingMode;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -117,6 +118,22 @@ pub(crate) async fn prepare_rendered_prompt(
             }
             multimodal_refs = Some(media_plan);
         } else {
+            // Preparation asked the matrix with a worker that processes
+            // references itself counted as taking every modality, which
+            // holds only while a reference can travel to it. This request
+            // resolved to the gateway's own pipeline under a placement that
+            // forwards where it can (`auto`, or a hinted request under
+            // `worker`), so none travels: the matrix alone answers, before
+            // any byte is fetched, with the refusal worker selection gave
+            // after the decode. Under `router` preparation asked it so.
+            if mm_components.processing != MmProcessingMode::Router {
+                multimodal::ensure_model_accepts_media(
+                    &ctx.components.worker_registry,
+                    model_id,
+                    &media_plan,
+                    true,
+                )?;
+            }
             // The dtype every worker the selection can pick reads image
             // pixels in, when they agree (and the one-pass write is not
             // switched off, `SMG_MM_ONE_PASS_WIRE=0`): the preprocessor
@@ -212,14 +229,17 @@ pub(crate) async fn prepare_rendered_prompt(
 mod tests {
     use std::sync::Arc;
 
-    use axum::http::StatusCode;
+    use axum::{http::StatusCode, response::Response};
     use llm_multimodal::{MediaContentPart, Modality};
     use llm_tokenizer::{
         mock::MockTokenizer,
         traits::{PromptEncoding, Tokenizer},
         TokenizerRegistry,
     };
-    use openai_protocol::{chat::ChatCompletionRequest, worker::MmProcessingMode};
+    use openai_protocol::{
+        chat::ChatCompletionRequest,
+        worker::{MmProcessingMode, RuntimeType},
+    };
     use tracing::Level;
 
     use super::prepare_rendered_prompt;
@@ -231,20 +251,29 @@ mod tests {
             grpc::{
                 context::RequestContext,
                 multimodal::{
-                    media_refs_pipeline_pin, MediaPlan, MultimodalComponents,
-                    MultimodalConfigRegistry, MultimodalSettings, PlaceholderTokens,
+                    ensure_model_accepts_media, media_refs_pipeline_pin, MediaPlan,
+                    MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+                    PlaceholderTokens, GATEWAY_PIPELINE_PROCESSOR, MM_PROCESSOR_LABEL,
                 },
                 regular::stages::testing::components_over,
                 testing::unreadable_model_dir,
                 utils::MediaContext,
             },
         },
-        worker::WorkerRegistry,
+        worker::{
+            test_support::{grpc_worker, no_health_check, registry_with},
+            BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerRegistry, WorkerType,
+        },
     };
 
     /// A request context for model "m" over the mock tokenizer, and the
     /// tokenizer.
     async fn context() -> (RequestContext, Arc<dyn Tokenizer>) {
+        context_over(WorkerRegistry::new()).await
+    }
+
+    /// The same over `registry`, whose workers serve model "m".
+    async fn context_over(registry: WorkerRegistry) -> (RequestContext, Arc<dyn Tokenizer>) {
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
         let tokenizer_registry = Arc::new(TokenizerRegistry::new());
         let loaded = tokenizer.clone();
@@ -254,7 +283,7 @@ mod tests {
             .unwrap();
         let components = components_over(
             tokenizer_registry,
-            Arc::new(WorkerRegistry::new()),
+            Arc::new(registry),
             crate::config::ParserChoice::Legacy,
         );
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -452,5 +481,170 @@ mod tests {
         assert!(rendered.multimodal_intermediate.is_none());
         assert!(rendered.multimodal_refs.is_none());
         assert_eq!(ctx.state.media_refs_pipeline, PipelinePin::Any);
+    }
+
+    /// The code and the message of a 400.
+    async fn refusal(response: Response) -> (String, String) {
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let code = response
+            .headers()
+            .get("x-smg-error-code")
+            .and_then(|v| v.to_str().ok())
+            .expect("code header")
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        let message = body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string();
+        (code, message)
+    }
+
+    /// Media the gateway processes itself under a placement that forwards
+    /// references where it can is refused for a modality no engine of the
+    /// pool takes before any byte is fetched, with the matrix's sentence:
+    /// the refusal worker selection gave after the fetch and the decode.
+    /// One row for each way the placement resolves to the gateway. Every
+    /// pool holds a worker that processes references itself, so
+    /// preparation's check passes. The media is inline and does not decode,
+    /// and the model's configuration does not load, so a request that
+    /// reached the pipeline would fail there, with another code and no fetch.
+    #[tokio::test]
+    async fn media_the_gateway_resolves_to_process_is_refused_before_the_fetch() {
+        fn refs_worker(url: &str) -> Arc<dyn Worker> {
+            grpc_worker(
+                url,
+                "m",
+                RuntimeType::Vllm,
+                &[(MM_PROCESSOR_LABEL, "inprocess")],
+            )
+        }
+        fn pipeline_worker(url: &str) -> Arc<dyn Worker> {
+            grpc_worker(
+                url,
+                "m",
+                RuntimeType::Sglang,
+                &[(MM_PROCESSOR_LABEL, GATEWAY_PIPELINE_PROCESSOR)],
+            )
+        }
+        fn audio() -> MediaPlan {
+            MediaPlan::new([MediaContentPart::AudioBase64 {
+                media_type: "audio/wav".to_string(),
+                data: Arc::new("AAAA".to_string()),
+                uuid: None,
+            }])
+        }
+        fn hinted_video() -> MediaPlan {
+            MediaPlan::new([MediaContentPart::VideoUrl {
+                url: "data:video/mp4;base64,AAAA".to_string().into(),
+                uuid: None,
+                fps: Some(1.0),
+                max_long_side_pixel: None,
+            }])
+        }
+        fn anchored(modality: Modality) -> PlaceholderTokens {
+            let mut placeholders = PlaceholderTokens::default();
+            placeholders.insert(modality, "token".to_string());
+            placeholders
+        }
+        // An anchor the worker expands itself: the model's own opt-in.
+        fn expandable(modality: Modality) -> PlaceholderTokens {
+            let mut placeholders = anchored(modality);
+            placeholders.set_worker_expandable(modality, true);
+            placeholders
+        }
+        const NO_AUDIO: &str = "backend vllm does not support audio inputs";
+        const NO_VIDEO: &str = "backend sglang does not support video inputs";
+        let encode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:9813")
+                .model(ModelCard::new("m"))
+                .worker_type(WorkerType::Encode)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .label(MM_PROCESSOR_LABEL, "inprocess")
+                .health_config(no_health_check())
+                .build(),
+        );
+        let model_dir = unreadable_model_dir();
+
+        for (name, mode, workers, plan, placeholders, text, sentence) in [
+            (
+                "auto, a pool where one worker processes references and one does not",
+                MmProcessingMode::Auto,
+                vec![
+                    refs_worker("grpc://127.0.0.1:9810"),
+                    grpc_worker("grpc://127.0.0.1:9811", "m", RuntimeType::Vllm, &[]),
+                ],
+                audio(),
+                expandable(Modality::Audio),
+                "Hello token",
+                NO_AUDIO,
+            ),
+            (
+                "auto, an encode-prefill-decode pool",
+                MmProcessingMode::Auto,
+                vec![refs_worker("grpc://127.0.0.1:9812"), encode],
+                audio(),
+                expandable(Modality::Audio),
+                "Hello token",
+                NO_AUDIO,
+            ),
+            (
+                "auto, a model whose anchor the worker does not expand",
+                MmProcessingMode::Auto,
+                vec![refs_worker("grpc://127.0.0.1:9814")],
+                audio(),
+                anchored(Modality::Audio),
+                "Hello token",
+                NO_AUDIO,
+            ),
+            (
+                "auto, a hinted item",
+                MmProcessingMode::Auto,
+                vec![pipeline_worker("grpc://127.0.0.1:9815")],
+                hinted_video(),
+                anchored(Modality::Video),
+                "Hello token",
+                NO_VIDEO,
+            ),
+            (
+                "worker, a hinted item the gateway's pipeline serves",
+                MmProcessingMode::Worker,
+                vec![pipeline_worker("grpc://127.0.0.1:9816")],
+                hinted_video(),
+                anchored(Modality::Video),
+                "Hello token",
+                NO_VIDEO,
+            ),
+        ] {
+            let registry = registry_with(workers);
+            assert!(
+                ensure_model_accepts_media(&registry, "m", &plan, false).is_ok(),
+                "{name}: preparation's check passes"
+            );
+            let (mut ctx, tokenizer) = context_over(registry).await;
+            let mut media = media_for(plan, mode, placeholders);
+            media.tokenizer_source = model_dir.path().to_str().unwrap().to_string();
+
+            let Err(response) = prepare_rendered_prompt(
+                &mut ctx,
+                &tokenizer,
+                text,
+                PromptEncoding::FromText,
+                Some(media),
+                &[],
+                "test",
+            )
+            .await
+            else {
+                panic!("{name}: the media is refused");
+            };
+            let (code, message) = refusal(response).await;
+            assert_eq!(code, "multimodal_not_supported", "{name}");
+            assert_eq!(message, sentence, "{name}");
+        }
     }
 }
