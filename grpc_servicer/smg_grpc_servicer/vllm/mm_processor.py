@@ -119,8 +119,7 @@ class MmMediaFetchFault(MmProcessorUnavailable):
 
 # System errors of a connection attempt that name this worker, not the
 # reference's host: its descriptors, buffers, memory or local addresses ran
-# out, its interface or its route is down, or its resolver cannot answer for
-# now. Another worker may connect.
+# out, or its interface or its route is down. Another worker may connect.
 _LOCAL_CONNECT_ERRNOS = frozenset(
     {
         errno.EMFILE,
@@ -130,8 +129,14 @@ _LOCAL_CONNECT_ERRNOS = frozenset(
         errno.EADDRNOTAVAIL,
         errno.ENETDOWN,
         errno.ENETUNREACH,
-        socket.EAI_AGAIN,
     }
+)
+
+# A resolver's codes for a name that does not exist or has no address: the
+# reference's own. Any other resolver failure, one that carries no code
+# among them, may be this worker's resolver.
+_UNRESOLVED_NAME_CODES = frozenset(
+    {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)}
 )
 
 
@@ -144,15 +149,17 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
     The proxy's own failures are the worker's egress, and are tested first
     because they are connector and response errors too. A connector error
     that wraps one of the worker's own limits (`_LOCAL_CONNECT_ERRNOS`) is
-    the worker's as well. Everything else that
-    reaches the fetch arm stays retryable: a loader the worker lacks, a
-    decode or a resize failure, an origin 408 or 429, a transfer that breaks
-    in the body.
+    the worker's as well, and a resolver failure is the reference's only
+    under a code that says the name is missing (`_UNRESOLVED_NAME_CODES`).
+    Everything else that reaches the fetch arm stays retryable: a loader
+    the worker lacks, a decode or a resize failure, an origin 408 or 429,
+    a transfer that breaks in the body.
     """
     # Resolved here: a client library without these classes fails where the
     # classifier is built, not inside a request's failure arm.
     proxy = (http.ClientProxyConnectionError, http.ClientHttpProxyError)
     connector = http.ClientConnectorError
+    dns = http.ClientConnectorDNSError
     response = http.ClientResponseError
     timeouts = (TimeoutError, asyncio.TimeoutError)
 
@@ -166,8 +173,13 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
             # The kernel's connect timeout arrives inside a connector error.
             if isinstance(os_error, timeouts):
                 return MEDIA_FAULT_TRANSIENT
-            # So do the worker's own limits and its resolver's "try again".
-            if getattr(os_error, "errno", None) in _LOCAL_CONNECT_ERRNOS:
+            code = getattr(os_error, "errno", None)
+            # A name is the reference's only when the resolver says it does
+            # not exist; any other resolver failure may be this worker's.
+            if isinstance(error, dns):
+                return MEDIA_FAULT_CLIENT if code in _UNRESOLVED_NAME_CODES else None
+            # The worker's own limits arrive inside a connector error too.
+            if code in _LOCAL_CONNECT_ERRNOS:
                 return None
             return MEDIA_FAULT_CLIENT
         if isinstance(error, response) and error.status >= 500:

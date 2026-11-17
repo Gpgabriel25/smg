@@ -859,7 +859,9 @@ class TestFetchErrorClassification:
                 None,
             ),
             (
-                http.ClientConnectorDNSError(OSError(-2, "Name or service not known")),
+                http.ClientConnectorDNSError(
+                    socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+                ),
                 "client",
                 None,
             ),
@@ -880,9 +882,12 @@ class TestFetchErrorClassification:
 
     def test_a_failure_that_does_not_name_the_reference_stays_retryable_and_untyped(self):
         """The worker's own: its proxy (a connector and a response error too,
-        so tested first), its own limits, its lost route and its resolver's
-        "try again" inside a connector error, and a loader it lacks. And what stays as it
-        was: an origin 408 or 429, and a transfer that breaks in the body."""
+        so tested first), its own limits and its lost route inside a
+        connector error, and a loader it lacks. A resolver failure that does
+        not say the name is missing: a "try again", a server failure, and
+        the asynchronous resolver's, which carries no code. And what stays
+        as it was: an origin 408 or 429, and a transfer that breaks in the
+        body."""
         http = self._Http
         for exc in [
             http.ClientProxyConnectionError(ConnectionRefusedError(111, "Connect call failed")),
@@ -892,6 +897,11 @@ class TestFetchErrorClassification:
             http.ClientConnectorDNSError(
                 socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
             ),
+            http.ClientConnectorDNSError(
+                socket.gaierror(socket.EAI_FAIL, "Non-recoverable failure in name resolution")
+            ),
+            http.ClientConnectorDNSError(OSError(None, "Could not contact DNS servers")),
+            http.ClientConnectorDNSError(OSError(None, "Domain name not found")),
             ImportError("no audio backend"),
             NotImplementedError("load_bytes is not implemented"),
             http.ClientResponseError(429),
@@ -912,8 +922,9 @@ class TestFetchErrorClassification:
 
     def test_the_classifier_reads_the_http_clients_own_exceptions(self):
         """The same table over the real library, where it is installed: its
-        proxy errors are connector and response errors, its timeouts are
-        timeout errors, and a broken transfer is none of the typed ones."""
+        proxy errors are connector and response errors, its resolver's
+        failures are DNS connector errors, its timeouts are timeout errors,
+        and a broken transfer is none of the typed ones."""
         aiohttp = pytest.importorskip("aiohttp")
         classify = mm_processor.fetch_fault_classifier(aiohttp)
         key = types.SimpleNamespace(host="a", port=443, ssl=True, is_ssl=True)
@@ -926,8 +937,13 @@ class TestFetchErrorClassification:
         assert classify(aiohttp.ClientProxyConnectionError(key, refused)) is None
         exhausted = OSError(errno.EMFILE, "Too many open files")
         assert classify(aiohttp.ClientConnectorError(key, exhausted)) is None
+        missing = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        assert classify(aiohttp.ClientConnectorDNSError(key, missing)) == "client"
         again = socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
-        assert classify(aiohttp.ClientConnectorError(key, again)) is None
+        assert classify(aiohttp.ClientConnectorDNSError(key, again)) is None
+        # The asynchronous resolver's failures carry no code.
+        no_code = OSError(None, "Could not contact DNS servers")
+        assert classify(aiohttp.ClientConnectorDNSError(key, no_code)) is None
         assert classify(aiohttp.ServerTimeoutError()) == "transient"
         assert classify(aiohttp.ClientResponseError(None, (), status=502)) == "transient"
         assert classify(aiohttp.ClientResponseError(None, (), status=429)) is None
