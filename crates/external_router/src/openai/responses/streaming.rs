@@ -808,15 +808,24 @@ pub(super) async fn handle_simple_streaming_passthrough(
     response
 }
 
+/// The most a turn's read-ahead holds, in bytes: what was taken off the
+/// upstream's stream while a tool call ran and the relay has not read yet.
+const READ_AHEAD_BOUND: usize = 8 * 1024 * 1024;
+
 /// One upstream turn's byte stream, read ahead while the turn's tool calls
 /// run. The client that sent the request gives it one deadline, from its
 /// start to the last byte of its body, so a stream left unread while a tool
 /// runs would be read again past that deadline. What `read_during` takes off
-/// the stream waits here in order (the rest of one turn at most) and is
-/// yielded before the stream is polled again.
+/// the stream waits here in order, up to `bound` bytes, and is yielded
+/// before the stream is polled again. At the bound the rest of the turn
+/// waits unread until the calls are done.
 struct TurnStream<S> {
     upstream: S,
     read_ahead: VecDeque<reqwest::Result<Bytes>>,
+    /// The bytes waiting in `read_ahead`.
+    read_ahead_bytes: usize,
+    /// `READ_AHEAD_BOUND`, or a test's own.
+    bound: usize,
     /// The stream ended or broke under `read_during`: it is not polled
     /// again.
     ended: bool,
@@ -827,25 +836,36 @@ impl<S: Stream<Item = reqwest::Result<Bytes>> + Unpin> TurnStream<S> {
         Self {
             upstream,
             read_ahead: VecDeque::new(),
+            read_ahead_bytes: 0,
+            bound: READ_AHEAD_BOUND,
             ended: false,
         }
     }
 
-    /// Runs `work` to its end and reads the stream meanwhile.
+    /// Runs `work` to its end and reads the stream meanwhile, up to the
+    /// read-ahead's bound.
     async fn read_during<T>(&mut self, work: impl Future<Output = T>) -> T {
         tokio::pin!(work);
         loop {
             tokio::select! {
                 output = &mut work => return output,
-                read = self.upstream.next(), if !self.ended => match read {
+                read = self.upstream.next(), if !self.ended && !self.read_ahead_is_full() => match read {
                     Some(chunk) => {
-                        self.ended = chunk.is_err();
+                        match &chunk {
+                            Ok(bytes) => self.read_ahead_bytes += bytes.len(),
+                            Err(_) => self.ended = true,
+                        }
                         self.read_ahead.push_back(chunk);
                     }
                     None => self.ended = true,
                 },
             }
         }
+    }
+
+    /// Whether the read-ahead holds its bound: the stream waits unread.
+    fn read_ahead_is_full(&self) -> bool {
+        self.read_ahead_bytes >= self.bound
     }
 }
 
@@ -854,6 +874,9 @@ impl<S: Stream<Item = reqwest::Result<Bytes>> + Unpin> Stream for TurnStream<S> 
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some(chunk) = self.read_ahead.pop_front() {
+            if let Ok(bytes) = &chunk {
+                self.read_ahead_bytes -= bytes.len();
+            }
             return Poll::Ready(Some(chunk));
         }
         if self.ended {
@@ -1146,6 +1169,8 @@ pub(super) fn handle_streaming_with_tool_interception(
         let auth_header =
             provider.extract_auth_header(headers_opt.as_ref(), worker_api_key.as_ref());
 
+        // The read-ahead's bound is logged once a request.
+        let mut read_ahead_full_logged = false;
         let (handler, end) = 'turns: loop {
             // Make streaming request
             let mut request_builder = client_clone.post(&url_clone).json(&current_payload);
@@ -1262,6 +1287,13 @@ pub(super) fn handle_streaming_with_tool_interception(
                     .await;
                 if !executed {
                     return;
+                }
+                if upstream_stream.read_ahead_is_full() && !read_ahead_full_logged {
+                    read_ahead_full_logged = true;
+                    warn!(
+                        bound_bytes = READ_AHEAD_BOUND,
+                        "The read-ahead of an upstream turn reached its bound while a tool call ran: the rest of the turn is read after the call"
+                    );
                 }
 
                 if !skipped.is_empty() {
@@ -2327,10 +2359,11 @@ mod tests {
     }
 
     /// The turn's stream is read while a call runs. The work here ends only
-    /// when the stream has taken what it sends (three chunks through a
-    /// channel of one slot), the way a tool's run outlasts a request's
-    /// deadline on a stream left unread. What was read meanwhile comes out
-    /// afterwards in order, then the stream's end.
+    /// when the stream has taken two of its three chunks (the channel has
+    /// one slot, so the third can rest in it), the way a tool's run outlasts
+    /// a request's deadline on a stream left unread. What was read meanwhile
+    /// comes out afterwards in order, then the stream's end. A turn under
+    /// the read-ahead's bound does not fill it.
     #[tokio::test]
     async fn the_turns_stream_is_read_while_a_call_runs() {
         use tokio::sync::mpsc;
@@ -2348,11 +2381,50 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_during(work))
             .await
             .expect("the work ends once the stream is read");
+        assert!(!stream.read_ahead_is_full());
         let mut read = Vec::new();
         while let Some(chunk) = stream.next().await {
             read.push(chunk.expect("a chunk"));
         }
         assert_eq!(read, ["one", "two", "three"]);
+    }
+
+    /// The read-ahead stops at its bound: the rest of the turn waits unread
+    /// while the call runs and is read after it, in order. The whole turn is
+    /// in the channel before the work starts and the work gives the reader
+    /// every chance, so what the read-ahead holds is the bound's doing: the
+    /// chunk that reached it, and no more.
+    #[tokio::test]
+    async fn the_read_ahead_stops_at_its_bound_and_the_rest_is_read_after_the_call() {
+        use tokio::sync::mpsc;
+
+        let (chunks, upstream) = mpsc::channel::<reqwest::Result<Bytes>>(4);
+        for chunk in ["one", "two", "three", "four"] {
+            chunks
+                .send(Ok(Bytes::from_static(chunk.as_bytes())))
+                .await
+                .expect("a free slot");
+        }
+        drop(chunks);
+        let mut stream = TurnStream {
+            bound: 4,
+            ..TurnStream::new(ReceiverStream::new(upstream))
+        };
+        stream
+            .read_during(async {
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        assert!(stream.read_ahead_is_full());
+        assert_eq!(stream.read_ahead_bytes, 6, "one and two");
+        let mut read = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            read.push(chunk.expect("a chunk"));
+        }
+        assert_eq!(read, ["one", "two", "three", "four"]);
+        assert_eq!(stream.read_ahead_bytes, 0);
     }
 
     /// A turn's stream that ended while a call ran is not polled again: the

@@ -618,7 +618,9 @@ fn call_anchor_events(events: &[Value]) -> Vec<(usize, &'static str)> {
 /// The stream of the OpenAI-mode route for a turn in which the upstream asks
 /// for two tools at once (the mock worker's two-call turn), over a mock MCP
 /// server that runs both.
-async fn openai_mode_two_call_events() -> Result<Vec<Value>, Box<dyn Error + Send + Sync>> {
+async fn openai_mode_two_call_events(
+    max_tool_calls: Option<u32>,
+) -> Result<Vec<Value>, Box<dyn Error + Send + Sync>> {
     let mut mcp = common::mock_mcp_server::MockMCPServer::start().await?;
     let dir = tempfile::tempdir()?;
     let mcp_config = dir.path().join("mcp.yaml");
@@ -658,6 +660,7 @@ async fn openai_mode_two_call_events() -> Result<Vec<Value>, Box<dyn Error + Sen
         "instructions": TWO_CALL_TURN,
         "stream": true,
         "store": false,
+        "max_tool_calls": max_tool_calls,
         "tools": [{
             "type": "mcp", "server_label": "mock", "server_url": mcp.url(),
             "require_approval": "never",
@@ -702,7 +705,7 @@ async fn both_streamed_tool_loops_write_a_turn_of_two_calls_call_by_call() {
         Some(&output), None, "completed", true, Some(1),
     ).await;
     mcp.stop().await;
-    let openai_mode = openai_mode_two_call_events().await.unwrap();
+    let openai_mode = openai_mode_two_call_events(None).await.unwrap();
 
     let call_by_call = [
         (0, "opened"),
@@ -723,6 +726,40 @@ async fn both_streamed_tool_loops_write_a_turn_of_two_calls_call_by_call() {
         call_anchor_events(&openai_mode),
         call_by_call,
         "the OpenAI-mode route: {openai_mode:?}"
+    );
+}
+
+/// The same turn of two calls on the OpenAI-mode route against an allowance
+/// of one call. The first call runs. The second, which the loop meets at its
+/// second hand-over of the one upstream stream, is closed as not executed,
+/// and the terminal says why.
+#[tokio::test]
+async fn the_openai_mode_loop_stops_a_turn_of_two_calls_at_an_allowance_of_one() {
+    let events = openai_mode_two_call_events(Some(1)).await.unwrap();
+    let types: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect();
+    let count = |kind: &str| types.iter().filter(|name| **name == kind).count();
+    assert_eq!(count("response.mcp_call.completed"), 1, "{types:?}");
+    assert_eq!(count("response.mcp_call.failed"), 1, "{types:?}");
+    let failed_at = types
+        .iter()
+        .position(|name| *name == "response.mcp_call.failed")
+        .unwrap();
+    assert_eq!(
+        &types[failed_at..],
+        [
+            "response.mcp_call.failed",
+            "response.output_item.done",
+            "response.completed"
+        ],
+        "{types:?}"
+    );
+    let terminal = events.last().unwrap();
+    assert_eq!(
+        terminal["response"]["incomplete_details"]["reason"], "max_tool_calls",
+        "{terminal}"
     );
 }
 

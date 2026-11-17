@@ -3412,6 +3412,73 @@ async fn a_tool_that_outruns_the_request_timeout_does_not_fail_the_stream() {
     mcp.stop().await;
 }
 
+/// A turn whose rest is larger than the loop's read-ahead while its tool
+/// runs: the loop stops reading ahead at its bound, the rest of the turn
+/// waits unread until the call is done, and the stream ends as the same
+/// request ends without the padding: the call that fit ran, the one over
+/// the limit is closed, then the terminal. The padding is nine mebibytes of
+/// comment blocks, which the relay drops, behind the first turn's call.
+#[tokio::test]
+async fn a_turn_larger_than_the_read_ahead_ends_as_the_same_turn_under_it() {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    let padding = format!(": {}\n\n", "x".repeat(1020)).repeat(9 * 1024);
+    let turns = Arc::new(AtomicUsize::new(0));
+    let padded_first_turn = axum::routing::post(move || {
+        let turn = turns.fetch_add(1, Ordering::SeqCst) + 1;
+        let events = function_call_turn_events(turn);
+        let events = match events.rsplit_once("event: response.completed") {
+            Some((calls, terminal)) if turn == 1 => {
+                format!("{calls}{padding}event: response.completed{terminal}")
+            }
+            _ => events,
+        };
+        async move { ([(CONTENT_TYPE, "text/event-stream")], events) }
+    });
+    let mut mcp = MockMCPServer::start_with_latency(Duration::from_millis(500))
+        .await
+        .expect("start mcp");
+    let (upstream, server) = stub_upstream(padded_first_turn).await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), Some(1))).await;
+
+    let events = frame_events(&body);
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !types
+            .iter()
+            .any(|kind| matches!(*kind, "error" | "response.failed")),
+        "{types:?}"
+    );
+    let failed_at = types
+        .iter()
+        .position(|kind| *kind == "response.mcp_call.failed")
+        .expect("the skipped call's failed event");
+    assert_eq!(
+        &types[failed_at..],
+        [
+            "response.mcp_call.failed",
+            "response.output_item.done",
+            "response.completed"
+        ],
+        "{types:?}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{types:?}");
+    assert_eq!(mcp.call_count(), 1, "the one call that fit ran: {types:?}");
+    server.abort();
+    mcp.stop().await;
+}
+
 /// An upstream status answered before the first byte of the first turn: the
 /// stream is the one typed error event, the upstream's own code and message,
 /// at sequence number 0; no event name, no sentinel.
