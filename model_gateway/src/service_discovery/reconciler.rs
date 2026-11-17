@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-use openai_protocol::worker::WorkerSpec;
+use openai_protocol::worker::{WorkerSpec, WorkerStatus};
 use tokio::time;
 use tracing::{error, info, warn};
 
@@ -97,6 +97,9 @@ pub(super) struct OwnedWorker {
     /// Revision guard for removal: a concurrently replaced worker is skipped
     /// and re-evaluated on the next pass instead of removed blindly.
     pub(super) revision: u64,
+    /// Whether the registration is draining: a removal has taken it out of
+    /// service and has not removed it yet.
+    pub(super) draining: bool,
 }
 
 /// One canonical endpoint to remove, carrying every registry worker that
@@ -165,6 +168,7 @@ fn owned_workers(app_context: &AppContext, kind: DiscoveryKind) -> Vec<OwnedWork
                 spec_hash,
                 endpoint,
                 revision: worker.revision(),
+                draining: worker.status() == WorkerStatus::Draining,
             })
         })
         .collect()
@@ -202,6 +206,16 @@ pub(super) struct ReconcileActions {
 ///   removed only as a leftover beside a current registration, such as the old
 ///   spelling after a scheme change, whose URL differs from the current one.
 ///
+/// A registration that is draining does not make its endpoint current: a
+/// removal has taken it out of service and has not removed it yet. When the
+/// provider publishes the worker again meanwhile and nothing else at the
+/// endpoint is current, the worker is added again. The Upsert replaces the
+/// draining registration in place and puts it back in service, and the
+/// removal, pinned to the registration it selected, then leaves it alone.
+/// Left as it was, the worker would be removed when its drain ends and stay
+/// out until the next pass. The draining registration itself is queued for
+/// nothing: the removal that drains it is in flight.
+///
 /// An endpoint no longer published is removed. A DP group yields one removal
 /// per endpoint, carrying a guard for every rank.
 pub(super) fn compute_actions(
@@ -228,7 +242,9 @@ pub(super) fn compute_actions(
                 if worker.discovery_id.as_deref() == Some(published.discovery_id.as_str()) =>
             {
                 if worker.spec_hash.as_deref() == fingerprints.get(&key).map(String::as_str) {
-                    has_current.insert(key);
+                    if !worker.draining {
+                        has_current.insert(key);
+                    }
                 } else {
                     not_current.push((key, worker, true));
                 }
@@ -367,6 +383,21 @@ pub(super) async fn reconcile(
             .get_status(url)
             .is_some_and(|status| status.status == "pending" || status.status == "processing")
     };
+    // Endpoints with a draining registration, each with whether a job holds
+    // that registration's own URL. A `DELETE` queues its removal there, and a
+    // DP rank's URL carries its rank, which the check of the published URL
+    // below does not read. A worker a `DELETE` is draining is that removal's
+    // until its job ends, so no addition replaces it meanwhile. Elsewhere an
+    // addition replaces the draining registration in place, and its line
+    // says so.
+    let mut draining: HashMap<EndpointKey, bool> = HashMap::new();
+    for worker in registered.iter().filter(|worker| worker.draining) {
+        let held = app_context
+            .worker_registry
+            .get_url_by_id(&worker.worker_id)
+            .is_some_and(|url| in_flight(&url));
+        *draining.entry(worker.endpoint.key()).or_default() |= held;
+    }
     let removals: Vec<&RemovalTarget> = actions
         .remove
         .iter()
@@ -375,7 +406,10 @@ pub(super) async fn reconcile(
     let additions: Vec<&DiscoveredWorker> = actions
         .add
         .iter()
-        .filter(|worker| !in_flight(&worker.endpoint.render()))
+        .filter(|worker| {
+            !in_flight(&worker.endpoint.render())
+                && (draining.is_empty() || draining.get(&worker.endpoint.key()) != Some(&true))
+        })
         .collect();
 
     if removals.is_empty() && additions.is_empty() {
@@ -427,9 +461,18 @@ pub(super) async fn reconcile(
     }
 
     for worker in additions {
+        let replaces_draining =
+            !draining.is_empty() && draining.contains_key(&worker.endpoint.key());
         info!(
-            "Registering worker {} ({:?}) as {}",
-            worker.endpoint, worker.worker_type, worker.discovery_id
+            "Registering worker {} ({:?}) as {}{}",
+            worker.endpoint,
+            worker.worker_type,
+            worker.discovery_id,
+            if replaces_draining {
+                ", replacing a registration that is draining"
+            } else {
+                ""
+            }
         );
         let job = Job::AddWorker {
             config: Box::new(build_worker_spec(worker, kind, app_context)),
