@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -48,7 +49,7 @@ use crate::{
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
-        otel_trace::inject_trace_context_http,
+        otel_trace::with_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry, WorkerRole},
     rate_limit::RateLimitManager,
@@ -123,18 +124,18 @@ struct PdLoadGuards {
 /// serialized sides and the two load guards taken apart, the request headers
 /// with the trace context injected (every side is sent under them), and the
 /// prefill engine's runtime label the PD metrics are recorded under.
-struct PdSetup {
+struct PdSetup<'a> {
     prefill_body: Bytes,
     decode_body: Bytes,
     prefill_guard: PrefillLoadGuard,
     decode_guard: WorkerLoadGuard,
-    headers_with_trace: HeaderMap,
+    headers_with_trace: Cow<'a, HeaderMap>,
     runtime: &'static str,
 }
 
-impl PdSetup {
+impl<'a> PdSetup<'a> {
     fn new(
-        headers: Option<&HeaderMap>,
+        headers: Option<&'a HeaderMap>,
         side_bodies: (Bytes, Bytes),
         guards: PdLoadGuards,
         prefill: &dyn Worker,
@@ -144,8 +145,7 @@ impl PdSetup {
             prefill: prefill_guard,
             decode: decode_guard,
         } = guards;
-        let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        inject_trace_context_http(&mut headers_with_trace);
+        let headers_with_trace = with_trace_context_http(headers);
         Self {
             prefill_body,
             decode_body,
@@ -1483,7 +1483,7 @@ impl PDRouter {
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
-        let headers = Some(&headers_with_trace);
+        let headers = Some(&*headers_with_trace);
 
         // Build both requests
         let prefill_request = self.build_post_with_headers(
@@ -1839,7 +1839,7 @@ impl PDRouter {
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
-        let headers = Some(&headers_with_trace);
+        let headers = Some(&*headers_with_trace);
 
         let decode_side = match RawBody::parse(&decode_body) {
             Ok(body) => body,
@@ -2015,7 +2015,7 @@ impl PDRouter {
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
-        let headers = Some(&headers_with_trace);
+        let headers = Some(&*headers_with_trace);
         Metrics::record_pd_kv_connector_mode(KvConnectorMode::MoriIo.metrics_label());
         events::RequestPDSentEvent {
             prefill_url: prefill.redacted_url(),
