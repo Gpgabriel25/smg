@@ -5,6 +5,7 @@
 //! wait for all dependencies to complete successfully.
 
 use std::{
+    any::Any,
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -30,6 +31,20 @@ use crate::{
 
 /// How often a step waiting out its backoff reads its workflow's cancellation.
 const CANCELLATION_READ_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The error text of a step that failed without an error of its own: a plain
+/// `Failure` result, or a panic, whose message goes to the log alone.
+const PLAIN_FAILURE: &str = "Step failed";
+
+/// The message of a panic, for the log: the text it was raised with, when it
+/// was raised with one.
+fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
 
 #[derive(Default)]
 struct StepTracker {
@@ -759,7 +774,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 )]
                 tokio::spawn(async move {
                     engine
-                        .run_step(def, step_idx, instance_id, tx, tracker)
+                        .watch_step(def, step_idx, instance_id, tx, tracker)
                         .await;
                 });
             }
@@ -823,6 +838,49 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             })
             .await;
         Ok(())
+    }
+
+    /// One launched step and the reading of its end. The step runs on a task
+    /// of its own, so a panic in it ends that task alone, and this task then
+    /// settles the step as a failed step. Unread, the panic would leave the
+    /// step in `running` with no completion sent, and the workflow would wait
+    /// for it for good.
+    async fn watch_step(
+        self,
+        def: Arc<WorkflowDefinition<D>>,
+        step_idx: usize,
+        instance_id: WorkflowInstanceId,
+        tx: mpsc::Sender<(StepId, StepResult)>,
+        tracker: Arc<RwLock<StepTracker>>,
+    ) {
+        let step_task = self.clone_for_execution().run_step(
+            Arc::clone(&def),
+            step_idx,
+            instance_id,
+            tx.clone(),
+            Arc::clone(&tracker),
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the step's own task; its end is awaited right here"
+        )]
+        let Err(end) = tokio::spawn(step_task).await
+        else {
+            return;
+        };
+        // An end that is neither a return nor a panic is the runtime's
+        // shutdown: nothing is left to settle.
+        let Ok(panic) = end.try_into_panic() else {
+            return;
+        };
+        let step = &def.steps[step_idx];
+        tracing::error!(
+            instance_id = %instance_id,
+            step_id = %step.id,
+            panic = panic_message(&*panic),
+            "Step panicked"
+        );
+        self.settle_panicked(step, instance_id, &tx, &tracker).await;
     }
 
     /// One launched step, on its own task: the `run_if` gate, the step with
@@ -920,6 +978,40 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                     );
                 }
             }
+        }
+    }
+
+    /// The end of a step whose task panicked: a failed step's end. The step's
+    /// state and its failed event carry the text of a plain failure, and the
+    /// step's failure action applies. No attempt follows, whatever the retry
+    /// policy says, and the executor's failure hook is not called: the
+    /// executor is what panicked.
+    async fn settle_panicked(
+        &self,
+        step: &StepDefinition<D>,
+        instance_id: WorkflowInstanceId,
+        tx: &mpsc::Sender<(StepId, StepResult)>,
+        tracker: &RwLock<StepTracker>,
+    ) {
+        // A panic after the step settled leaves nothing to settle.
+        if !tracker.read().running.contains(&step.id) {
+            return;
+        }
+        if let Err(e) = self
+            .record_failure(instance_id, step, PLAIN_FAILURE, false)
+            .await
+        {
+            tracing::warn!(
+                step_id = %step.id,
+                error = ?e,
+                "Failed to record a panicked step as failed"
+            );
+        }
+        let completion = Completion::of(Ok(StepResult::Failure), step.on_failure);
+        Self::settle(tracker, tx, &step.id, completion.signal);
+        if let Some((status, last_error)) = completion.state {
+            self.record_step_status(instance_id, &step.id, status, last_error)
+                .await;
         }
     }
 
@@ -1175,7 +1267,7 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
             Ok(Ok(StepResult::Success)) => Outcome::Success,
             Ok(Ok(StepResult::Skip)) => Outcome::Skip,
             Ok(Ok(StepResult::Failure)) => Outcome::Failed {
-                error: "Step failed".to_string(),
+                error: PLAIN_FAILURE.to_string(),
                 retryable: false,
             },
             Ok(Err(e)) => Outcome::Failed {

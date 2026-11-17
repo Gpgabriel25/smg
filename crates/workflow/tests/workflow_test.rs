@@ -596,15 +596,59 @@ async fn test_dag_dependency_failure_blocks_dependents() {
     assert_eq!(b_executed.load(Ordering::SeqCst), 0);
 }
 
+/// How long the sibling step of the sibling tests runs, in milliseconds:
+/// long enough to be still running when the step beside it ends.
+const SIBLING_RUN_MS: u64 = 200;
+
+/// Runs a root and then two steps that depend on the root alone: `step_b`,
+/// the given executor under `FailWorkflow`, and `step_c`, a timing step that
+/// is still running when `step_b` ends. Comes back with the settled state
+/// and with how long `step_c` ran, when it ran to its end.
+async fn sibling_run(
+    id: &str,
+    step_b: Arc<dyn StepExecutor<TestWorkflowData>>,
+) -> Result<(WorkflowState<TestWorkflowData>, Option<Duration>), String> {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    let workflow = WorkflowDefinition::new(id, "Sibling Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new("step_b", "Step B", step_b)
+                .with_failure_action(FailureAction::FailWorkflow)
+                .depends_on(&["step_a"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C",
+                timing_step("step_c", SIBLING_RUN_MS, &start_times, &end_times),
+            )
+            .depends_on(&["step_a"]),
+        );
+
+    let instance_id = started(&engine, workflow).await?;
+    let state = wait_until_settled(&engine, instance_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let c_started = start_times.read().first().map(|(_, at)| *at);
+    let c_ended = end_times.read().first().map(|(_, at)| *at);
+    let c_ran = c_started
+        .zip(c_ended)
+        .map(|(start, end)| end.duration_since(start));
+    Ok((state, c_ran))
+}
+
 #[tokio::test]
 async fn test_dag_failed_step_leaves_its_independent_sibling_running() {
-    // A root, then two steps that depend on the root alone: step B fails under
-    // FailWorkflow, step C runs. The failure neither cancels nor skips the
-    // sibling: C ran once, and the workflow ends Failed.
-    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
-
-    let c_executed = Arc::new(AtomicU32::new(0));
-
+    // Step B fails under FailWorkflow while its sibling C is still running.
+    // The failure neither cancels nor skips the sibling: C runs its whole
+    // time and succeeds after B has failed, and the workflow ends Failed.
     struct FailingStep;
 
     #[async_trait::async_trait]
@@ -624,40 +668,21 @@ async fn test_dag_failed_step_leaves_its_independent_sibling_running() {
         }
     }
 
-    let workflow = WorkflowDefinition::new("sibling_workflow", "Sibling Test")
-        .add_step(StepDefinition::new(
-            "step_a",
-            "Step A",
-            Arc::new(AlwaysSucceedStep),
-        ))
-        .add_step(
-            StepDefinition::new("step_b", "Step B", Arc::new(FailingStep))
-                .with_failure_action(FailureAction::FailWorkflow)
-                .depends_on(&["step_a"]),
-        )
-        .add_step(
-            StepDefinition::new(
-                "step_c",
-                "Step C",
-                Arc::new(TrackingStep {
-                    counter: Arc::clone(&c_executed),
-                }),
-            )
-            .depends_on(&["step_a"]),
-        );
-
-    let instance_id = started(&engine, workflow).await.unwrap();
-
-    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    let (state, c_ran) = sibling_run("sibling_workflow", Arc::new(FailingStep))
+        .await
+        .unwrap();
     assert_eq!(state.status, WorkflowStatus::Failed);
-    assert_eq!(c_executed.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        state.step_states[&StepId::new("step_c")].status,
-        StepStatus::Succeeded
+    let b = &state.step_states[&StepId::new("step_b")];
+    let c = &state.step_states[&StepId::new("step_c")];
+    assert_eq!(b.status, StepStatus::Failed);
+    assert_eq!(c.status, StepStatus::Succeeded);
+    assert!(
+        b.completed_at.unwrap() < c.completed_at.unwrap(),
+        "the sibling ended before the failure landed"
     );
-    assert_eq!(
-        state.step_states[&StepId::new("step_b")].status,
-        StepStatus::Failed
+    assert!(
+        c_ran.unwrap() >= Duration::from_millis(SIBLING_RUN_MS),
+        "the sibling was cut short after {c_ran:?}"
     );
 }
 
@@ -2006,5 +2031,177 @@ async fn a_step_whose_cancel_lands_after_its_read_does_not_start() {
         state.step_states[&StepId::new("only_step")].status,
         StepStatus::Succeeded,
         "the step did not run on under the cancelled workflow"
+    );
+}
+
+// ============================================================================
+// A Step That Panics
+// ============================================================================
+
+/// The text the panicking step panics with. It is for the log: no state a
+/// caller reads carries it.
+const PANIC_TEXT: &str = "the panicking step's own text";
+
+/// A step that counts its attempts and panics on every one.
+struct PanickingStep {
+    attempts: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for PanickingStep {
+    #[expect(clippy::panic, reason = "the step under test is one that panics")]
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        panic!("{PANIC_TEXT}");
+    }
+}
+
+/// The step `boom`, which panics on every attempt and counts them in
+/// `attempts`.
+fn panicking(attempts: &Arc<AtomicU32>) -> StepDefinition<TestWorkflowData> {
+    StepDefinition::new(
+        "boom",
+        "Step that panics",
+        Arc::new(PanickingStep {
+            attempts: Arc::clone(attempts),
+        }),
+    )
+}
+
+/// Starts `workflow` and waits for its end through the engine's waiter, as a
+/// caller does, under a bound of two seconds: a workflow that hangs comes
+/// back as the waiter's timeout error.
+async fn ended(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    workflow: WorkflowDefinition<TestWorkflowData>,
+) -> Result<WorkflowState<TestWorkflowData>, String> {
+    let instance_id = started(engine, workflow).await?;
+    engine
+        .wait_for_terminal_state(instance_id, "the workflow", Duration::from_secs(2))
+        .await
+}
+
+#[tokio::test]
+async fn a_step_that_panics_fails_its_workflow() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let workflow =
+        WorkflowDefinition::new("panicking_workflow", "Panicking").add_step(panicking(&attempts));
+
+    // The workflow ends, and it ends failed: a caller waiting for it is
+    // answered, where it used to wait out its own timeout.
+    let state = ended(&engine, workflow).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let step = &state.step_states[&StepId::new("boom")];
+    assert_eq!(step.status, StepStatus::Failed);
+
+    // A caller reads the text of a plain failure beside the step's name. The
+    // panic's own text is nowhere in the state.
+    assert_eq!(step.last_error.as_deref(), Some("Step failed"));
+    assert_eq!(
+        wfaas::completion_outcome(&state, "the workflow"),
+        Err("Workflow failed at step boom: Step failed".to_string())
+    );
+    assert!(!format!("{state:?}").contains(PANIC_TEXT));
+}
+
+#[tokio::test]
+async fn a_step_that_panics_under_its_own_timeout_fails_at_once() {
+    // The step's timeout is a minute away, and an attempt that timed out
+    // would be retried: the panic is neither waited out nor taken for a
+    // timeout.
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let workflow = WorkflowDefinition::new("panicking_under_a_timeout", "Panicking")
+        .add_step(panicking(&attempts).with_timeout(Duration::from_secs(60)));
+
+    let state = ended(&engine, workflow).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let step = &state.step_states[&StepId::new("boom")];
+    assert_eq!(step.last_error.as_deref(), Some("Step failed"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_panicked_attempt_is_not_retried() {
+    // Five attempts are allowed, and under RetryIndefinitely any number: the
+    // attempt that panicked is the last one all the same.
+    for action in [
+        FailureAction::FailWorkflow,
+        FailureAction::RetryIndefinitely,
+    ] {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let workflow = WorkflowDefinition::new("panicking_with_retries", "Panicking").add_step(
+            panicking(&attempts)
+                .with_retry(RetryPolicy {
+                    max_attempts: 5,
+                    backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+                })
+                .with_failure_action(action),
+        );
+
+        let state = ended(&engine, workflow).await.unwrap();
+        assert_eq!(state.status, WorkflowStatus::Failed, "{action:?}");
+        let step = &state.step_states[&StepId::new("boom")];
+        assert_eq!(step.attempt, 1, "{action:?}");
+
+        // Time enough for further attempts, had any been due.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "{action:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_step_that_panics_under_continue_next_step_is_skipped() {
+    // The panicked step's failure action applies as a failed step's does:
+    // the step reads skipped, and the step that depends on it runs.
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let workflow = WorkflowDefinition::new("panicking_and_going_on", "Panicking")
+        .add_step(panicking(&attempts).with_failure_action(FailureAction::ContinueNextStep))
+        .add_step(
+            StepDefinition::new("after", "Step after the panic", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["boom"]),
+        );
+
+    let state = ended(&engine, workflow).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(
+        state.step_states[&StepId::new("boom")].status,
+        StepStatus::Skipped
+    );
+    assert_eq!(
+        state.step_states[&StepId::new("after")].status,
+        StepStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn a_step_that_panics_leaves_its_independent_sibling_running() {
+    // Step B panics while its sibling C is still running. The sibling ends
+    // as the sibling of a failed step does: C runs its whole time and
+    // succeeds after B has failed, and the workflow ends Failed.
+    let step_b = Arc::new(PanickingStep {
+        attempts: Arc::new(AtomicU32::new(0)),
+    });
+    let (state, c_ran) = sibling_run("panicking_sibling_workflow", step_b)
+        .await
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let b = &state.step_states[&StepId::new("step_b")];
+    let c = &state.step_states[&StepId::new("step_c")];
+    assert_eq!(b.status, StepStatus::Failed);
+    assert_eq!(c.status, StepStatus::Succeeded);
+    assert!(
+        b.completed_at.unwrap() < c.completed_at.unwrap(),
+        "the sibling ended before the panic landed"
+    );
+    assert!(
+        c_ran.unwrap() >= Duration::from_millis(SIBLING_RUN_MS),
+        "the sibling was cut short after {c_ran:?}"
     );
 }

@@ -253,6 +253,9 @@ Options:
 - `FailureAction::ContinueNextStep` - Skip failed step, continue workflow
 - `FailureAction::RetryIndefinitely` - Keep retrying until manual intervention
 
+A step that panics is a failed step: the panic's message is logged, the step's state reads `Step failed`,
+its failure action applies, and no further attempt is made whatever its retry policy says.
+
 ## Conditional Execution
 
 Skip steps based on runtime conditions:
