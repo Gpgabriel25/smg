@@ -813,9 +813,12 @@ class TestFetchErrorClassification:
             pass
 
         class ClientConnectorError(ClientError, OSError):
-            def __init__(self, os_error):
-                super().__init__(f"Cannot connect to host a:443 ssl:default [{os_error}]")
+            def __init__(self, os_error, host="a"):
+                super().__init__(f"Cannot connect to host {host}:443 ssl:default [{os_error}]")
                 self.os_error = os_error
+                # The host the connection was for: the reference's, unless
+                # a row names the proxy's or a redirect target's.
+                self.host = host
 
         class ClientProxyConnectionError(ClientConnectorError):
             pass
@@ -883,17 +886,24 @@ class TestFetchErrorClassification:
     def test_a_failure_that_does_not_name_the_reference_stays_retryable_and_untyped(self):
         """The worker's own: its proxy (a connector and a response error too,
         so tested first), its own limits and its lost route inside a
-        connector error, and a loader it lacks. A resolver failure that does
-        not say the name is missing: a "try again", a server failure, and
-        the asynchronous resolver's, which carries no code. And what stays
-        as it was: an origin 408 or 429, and a transfer that breaks in the
-        body."""
+        connector error, and a loader it lacks. A connector error under
+        another host than the reference's: the proxy's missing name, which
+        the client library reports as a plain DNS error, and a redirect's
+        target that refuses. A resolver failure that does not say the name
+        is missing: a "try again", a server failure, and the asynchronous
+        resolver's, which carries no code. And what stays as it was: an
+        origin 408 or 429, and a transfer that breaks in the body."""
         http = self._Http
         for exc in [
             http.ClientProxyConnectionError(ConnectionRefusedError(111, "Connect call failed")),
             http.ClientHttpProxyError(502),
             http.ClientConnectorError(OSError(errno.EMFILE, "Too many open files")),
             http.ClientConnectorError(OSError(errno.ENETUNREACH, "Network is unreachable")),
+            http.ClientConnectorDNSError(
+                socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
+                host="egress-proxy",
+            ),
+            http.ClientConnectorError(ConnectionRefusedError(111, "Connect call failed"), host="b"),
             http.ClientConnectorDNSError(
                 socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
             ),
@@ -923,10 +933,15 @@ class TestFetchErrorClassification:
     def test_the_classifier_reads_the_http_clients_own_exceptions(self):
         """The same table over the real library, where it is installed: its
         proxy errors are connector and response errors, its resolver's
-        failures are DNS connector errors, its timeouts are timeout errors,
-        and a broken transfer is none of the typed ones."""
+        failures are DNS connector errors, a connector error names its host,
+        its timeouts are timeout errors, and a broken transfer is none of
+        the typed ones."""
         aiohttp = pytest.importorskip("aiohttp")
-        classify = mm_processor.fetch_fault_classifier(aiohttp)
+        classifier = mm_processor.fetch_fault_classifier(aiohttp)
+
+        def classify(error):
+            return classifier(error, "https://a/1.png")
+
         key = types.SimpleNamespace(host="a", port=443, ssl=True, is_ssl=True)
         refused = ConnectionRefusedError(111, "Connect call failed")
         assert classify(aiohttp.ClientConnectorError(key, refused)) == "client"
@@ -949,6 +964,41 @@ class TestFetchErrorClassification:
         assert classify(aiohttp.ClientResponseError(None, (), status=429)) is None
         assert classify(aiohttp.ClientHttpProxyError(None, (), status=502)) is None
         assert classify(aiohttp.ClientPayloadError("Response payload is not completed")) is None
+        # The same errors under the proxy's host are the worker's own.
+        proxy_key = types.SimpleNamespace(host="egress-proxy", port=3128, ssl=False, is_ssl=False)
+        assert classify(aiohttp.ClientConnectorDNSError(proxy_key, missing)) is None
+        assert classify(aiohttp.ClientConnectorError(proxy_key, refused)) is None
+
+    def test_the_proxys_missing_name_is_not_the_references(self):
+        """Through a proxy the client library resolves the proxy's name
+        alone, and reports its missing name as the DNS error it raises for
+        the reference's own, under the proxy's host. A real session of the
+        library over a resolver that knows no name: the reference's missing
+        name is the media's, the proxy's stays the worker's."""
+        aiohttp = pytest.importorskip("aiohttp")
+        abc = pytest.importorskip("aiohttp.abc")
+
+        class _NoName(abc.AbstractResolver):
+            async def resolve(self, host, port=0, family=socket.AF_INET):
+                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+            async def close(self):
+                pass
+
+        classify = mm_processor.fetch_fault_classifier(aiohttp)
+        url = "http://Media.Example.com:8080/cat.png"
+
+        async def failure(proxy):
+            connector = aiohttp.TCPConnector(resolver=_NoName())
+            async with aiohttp.ClientSession(connector=connector) as session:
+                with pytest.raises(aiohttp.ClientConnectorDNSError) as raised:
+                    await session.get(url, proxy=proxy)
+            return raised.value
+
+        direct = run(failure(None))
+        assert (direct.host, classify(direct, url)) == ("media.example.com", "client")
+        proxied = run(failure("http://egress-proxy.example:3128"))
+        assert (proxied.host, classify(proxied, url)) == ("egress-proxy.example", None)
 
     def test_caller_errors_pass_through(self):
         p = self.processor(self._CallerError("415 Unsupported Media Type"))

@@ -22,6 +22,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
     CLIENT_ERROR_CODES,
@@ -140,20 +141,37 @@ _UNRESOLVED_NAME_CODES = frozenset(
 )
 
 
-def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
-    """The media-fault kind of a fetch failure, read from its type, or None
-    for one that stays the worker's and retryable. `http` is the HTTP client
-    library the fetcher uses: its exception classes.
+def _reference_host(url: str) -> str | None:
+    """The host of a reference's URL as the HTTP client's connector error
+    names it: lower-cased, without the port or an address's brackets. None
+    for a URL without one. A host the client writes in another form than
+    the URL does (an internationalized name) compares unequal, which leaves
+    the failure retryable."""
+    try:
+        return urlsplit(url).hostname
+    except ValueError:
+        return None
+
+
+def fetch_fault_classifier(http: Any) -> Callable[[BaseException, str], str | None]:
+    """The media-fault kind of a fetch failure, read from its type and the
+    reference's URL, or None for one that stays the worker's and retryable.
+    `http` is the HTTP client library the fetcher uses: its exception
+    classes.
 
     An allow-list: only what names the reference's host or origin is typed.
     The proxy's own failures are the worker's egress, and are tested first
-    because they are connector and response errors too. A connector error
-    that wraps one of the worker's own limits (`_LOCAL_CONNECT_ERRNOS`) is
-    the worker's as well, and a resolver failure is the reference's only
-    under a code that says the name is missing (`_UNRESOLVED_NAME_CODES`).
-    Everything else that reaches the fetch arm stays retryable: a loader
-    the worker lacks, a decode or a resize failure, an origin 408 or 429,
-    a transfer that breaks in the body.
+    because they are connector and response errors too. Not every one has
+    a class of its own: the proxy's missing name is the same DNS connector
+    error as the reference's, under the proxy's host. So a connector error
+    is the reference's only under the reference's own host
+    (`_reference_host`). Under that host, one that wraps one of the
+    worker's own limits (`_LOCAL_CONNECT_ERRNOS`) is the worker's as well,
+    and a resolver failure is the reference's only under a code that says
+    the name is missing (`_UNRESOLVED_NAME_CODES`). Everything else that
+    reaches the fetch arm stays retryable: a loader the worker lacks, a
+    decode or a resize failure, an origin 408 or 429, a transfer that
+    breaks in the body.
     """
     # Resolved here: a client library without these classes fails where the
     # classifier is built, not inside a request's failure arm.
@@ -163,7 +181,7 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
     response = http.ClientResponseError
     timeouts = (TimeoutError, asyncio.TimeoutError)
 
-    def classify(error: BaseException) -> str | None:
+    def classify(error: BaseException, url: str) -> str | None:
         if isinstance(error, proxy):
             return None
         if isinstance(error, timeouts):
@@ -173,6 +191,12 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
             # The kernel's connect timeout arrives inside a connector error.
             if isinstance(os_error, timeouts):
                 return MEDIA_FAULT_TRANSIENT
+            # The error names the host the connection was for. Any other
+            # host than the reference's is the worker's proxy (its name does
+            # not resolve, its handshake fails) or a redirect's target.
+            host = getattr(error, "host", None)
+            if host is None or host != _reference_host(url):
+                return None
             code = getattr(os_error, "errno", None)
             # A name is the reference's only when the resolver says it does
             # not exist; any other resolver failure may be this worker's.
@@ -189,7 +213,7 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
     return classify
 
 
-def _no_fetch_fault(error: BaseException) -> str | None:
+def _no_fetch_fault(error: BaseException, url: str) -> str | None:
     return None
 
 
@@ -393,7 +417,7 @@ class InProcessMediaProcessor:
     # The media-fault kind of a fetch failure (`fetch_fault_classifier`),
     # bound at construction to the fetcher's HTTP client; this default types
     # nothing, so every failure stays retryable.
-    _fetch_fault: Callable[[BaseException], str | None] = staticmethod(_no_fetch_fault)
+    _fetch_fault: Callable[[BaseException, str], str | None] = staticmethod(_no_fetch_fault)
 
     def __init__(
         self,
@@ -535,7 +559,7 @@ class InProcessMediaProcessor:
             ):
                 raise ValueError(f"media_refs[{index}]: {e}") from e
             logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
-            fault = self._fetch_fault(e)
+            fault = self._fetch_fault(e, item.url)
             if fault is not None:
                 # A timeout carries no words of its own.
                 words = str(e) or "timed out"
