@@ -81,6 +81,8 @@ pub(crate) use capability::{
     ensure_backend_supports_modalities, ensure_model_accepts_media, fleet_reads_format,
     request_needs_vision, worker_language_model_only, SUPPORTS_VISION_LABEL,
 };
+#[cfg(test)]
+pub(crate) use config::tests::{hub_answering, HubEnv};
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
@@ -93,7 +95,7 @@ pub(crate) use inflight::{
 pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
     anchor_rendered_markers, prepare_placeholder_tokens, resolve_media_part_order,
-    validate_rendered_media_anchors, MediaPlan, PlaceholderTokens, RequestRefusal,
+    validate_rendered_media_anchors, DeploymentFault, MediaPlan, PlaceholderTokens, RequestRefusal,
 };
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use refs::{
@@ -256,13 +258,16 @@ pub(crate) fn config_unavailable_response(error: &anyhow::Error) -> Option<Respo
 const PIPELINE_CODE: &str = "multimodal_processing_failed";
 
 /// The client's answer when the placeholder preparation fails for a cause
-/// the request did not bring and no hub answers for: the model's
-/// configuration cannot be read or parsed on this host, a spec's media
-/// limits or its placeholder token cannot be resolved from the model's
-/// files, the tokenizer's vocabulary lacks the token. A 500 under the
+/// its site marks as the deployment's own ([`DeploymentFault`]): a
+/// `config.json` this gateway holds and cannot read or parse, a spec's
+/// media limits or its placeholder token that cannot be resolved from the
+/// model's files, a vocabulary that lacks the token. A 500 under the
 /// pipeline's own code with a generic message: a client cannot fix it by
 /// its request, and the cause (the file, the token) is for the log at the
-/// call site.
+/// call site. Not the answer for a configuration found nowhere (none on
+/// this host, and a hub that has none or does not open it): the gateway
+/// cannot tell whether such a model takes media, so that failure keeps its
+/// 400.
 pub(crate) fn preparation_fault_response() -> Response {
     error::internal_error(
         PIPELINE_CODE,

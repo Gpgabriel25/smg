@@ -242,8 +242,8 @@ pub(crate) async fn prepare_placeholder_tokens(
 /// image override the model's spec does not take, media for a model with no
 /// media spec on the router. The stage that finds it in a failure's chain
 /// writes one WARN and marks its answer; every other failure of the
-/// preparation is the deployment's (the model's files, its vocabulary) and
-/// keeps the stage's ERROR line.
+/// preparation keeps the stage's ERROR line, the ones a site marks as the
+/// deployment's own ([`DeploymentFault`]) among them.
 #[derive(Debug)]
 pub(crate) struct RequestRefusal(String);
 
@@ -278,6 +278,35 @@ impl fmt::Display for RequestRefusal {
 }
 
 impl std::error::Error for RequestRefusal {}
+
+/// A failure of the placeholder preparation that its site knows as the
+/// deployment's own, whatever the request holds: a `config.json` this
+/// gateway holds and cannot read or parse, a spec's media limits or its
+/// placeholder token that the model's files do not resolve, a vocabulary
+/// without the token. The stage that finds it in a failure answers in the
+/// server's class ([`super::preparation_fault_response`]). A failure with
+/// neither this mark nor [`RequestRefusal`] keeps the 400 it had: a
+/// configuration found nowhere (none on this host, and a hub that has none
+/// or does not open it) is one, since the gateway cannot tell whether such a
+/// model takes media.
+#[derive(Debug)]
+pub(crate) struct DeploymentFault(pub(crate) String);
+
+impl DeploymentFault {
+    /// Whether `error` carries this mark: as its root, or as the context a
+    /// site put on a cause it keeps.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+impl fmt::Display for DeploymentFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeploymentFault {}
 
 /// `prepare_placeholder_tokens` with the deployment-wide limit override (the
 /// `SMG_*_MAX_COUNT` variables, read once per process) passed in: a test
@@ -341,7 +370,10 @@ async fn prepare_placeholder_tokens_with_env(
         );
     }
     let spec_limits = spec.modality_limits(&metadata).map_err(|error| {
-        anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
+        DeploymentFault(format!(
+            "reading the {} spec's media limits: {error}",
+            spec.name()
+        ))
     })?;
     // The router's own limits, capped by the engine's where its workers
     // advertise one; the refusal names the limit and what set it.
@@ -373,14 +405,16 @@ async fn prepare_placeholder_tokens_with_env(
             // The validation above has accepted the modality, so a failure
             // here is about the spec or the model's files, never the request.
             .map_err(|error| {
-                anyhow::anyhow!(
+                DeploymentFault(format!(
                     "model {} supports {modality} but its placeholder token could not be resolved: {error}",
                     spec.name()
-                )
+                ))
             })?;
         anyhow::ensure!(
             tokenizer.token_to_id(&token).is_some(),
-            "{modality} placeholder token '{token}' is missing from the tokenizer vocabulary"
+            DeploymentFault(format!(
+                "{modality} placeholder token '{token}' is missing from the tokenizer vocabulary"
+            ))
         );
         if let Some(marker) = spec.rendered_marker_for(modality) {
             placeholders.add_rendered_marker(marker.to_string(), token.clone());
