@@ -1870,6 +1870,20 @@ fn the_model_index_keeps_a_fixed_shard_count() {
     );
 }
 
+/// The per-model retry overrides are scanned on a request path, as the model
+/// index is counted on one, so their map keeps the same fixed shard count.
+#[test]
+fn the_retry_override_map_keeps_a_fixed_shard_count() {
+    use dashmap::Map as _;
+
+    let registry = WorkerRegistry::new();
+    assert_eq!(
+        registry.model_retry_configs._shard_count(),
+        16,
+        "the retry override map's shard count follows the CPUs"
+    );
+}
+
 #[test]
 fn routing_pool_reuses_uniform_model_snapshot() {
     let registry = WorkerRegistry::new();

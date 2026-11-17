@@ -411,12 +411,14 @@ struct GlobalRoutingSnapshot {
 /// and node maps the same way.
 type ModelIndex = Arc<DashMap<String, Arc<ModelWorkerSnapshot>, FxBuildHasher>>;
 
-/// Shards of the model index, on any host. Iterating the map costs one lock
-/// and one allocation a shard, whether the shard holds an entry or not, and
-/// [`WorkerRegistry::model_count`] iterates it on request paths: the count
-/// must not follow the CPUs the process sees, as the library's default does
-/// (four shards a CPU). The index holds one entry a model.
-const MODEL_INDEX_SHARDS: usize = 16;
+/// Shards of the maps that hold one entry a model and are iterated on
+/// request paths, on any host: the model index
+/// ([`WorkerRegistry::model_count`]) and the per-model retry overrides
+/// ([`WorkerRegistry::any_model_retry_override_enables_retries`]). Iterating
+/// a map costs one lock and one allocation a shard, whether the shard holds
+/// an entry or not: the count must not follow the CPUs the process sees, as
+/// the library's default does (four shards a CPU).
+const MODEL_MAP_SHARDS: usize = 16;
 
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
@@ -592,7 +594,7 @@ impl WorkerRegistry {
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::with_hasher_and_shard_amount(
                 FxBuildHasher,
-                MODEL_INDEX_SHARDS,
+                MODEL_MAP_SHARDS,
             )),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
@@ -615,7 +617,10 @@ impl WorkerRegistry {
             model_overloaded: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             overload_shed: Arc::new(AtomicBool::new(false)),
             overload_transitions: Arc::new(parking_lot::Mutex::new(())),
-            model_retry_configs: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            model_retry_configs: Arc::new(DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                MODEL_MAP_SHARDS,
+            )),
             worker_origins: Arc::new(DashMap::new()),
             import_records: Arc::new(DashMap::new()),
             // Sized for fleet-scale bursts (startup registration, probe
