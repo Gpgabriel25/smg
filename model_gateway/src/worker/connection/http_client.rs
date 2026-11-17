@@ -4,7 +4,8 @@
 #[cfg(test)]
 pub(crate) use smg_worker::connection::http_client::no_root_store;
 pub(crate) use smg_worker::connection::http_client::{
-    build_client, build_with, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS,
+    build_client, build_with, connect_timeout_secs_below, pool_idle_timeout,
+    DEFAULT_CONNECT_TIMEOUT_SECS,
 };
 pub use smg_worker::connection::http_client::{
     LazyHttpClient, WorkerHttpClientCache, WorkerHttpClientSettings,
