@@ -371,14 +371,13 @@ impl Call {
         }
     }
 
-    /// The scopes that make the call, by the contract's header: the
-    /// snapshot is the operators' read and a standby's re-sync base.
+    /// The scopes that make the call, by the contract's header.
     pub(crate) const fn scopes(self) -> &'static [Scope] {
         match self {
             Call::Session | Call::Decide | Call::WatchWorkers => &[Scope::Gateway],
             Call::PushLoad | Call::PushKvEvents => &[Scope::Ingestion],
-            Call::GetSnapshot => &[Scope::Control, Scope::Replication],
-            Call::RegisterWorker
+            Call::GetSnapshot
+            | Call::RegisterWorker
             | Call::PatchWorker
             | Call::DeregisterWorker
             | Call::Explain
@@ -775,23 +774,13 @@ impl PolicyController for Service {
             .map(Response::new)
     }
 
-    /// The complete snapshot, on the listener that mounts the replication
-    /// scope: a caller admitted there can ask `Replicate` for the same
-    /// rows. The control scope's redacted read is not served yet.
+    /// The operators' read, which this build does not serve. A standby is
+    /// restored on its `Replicate` stream, never from this call.
     async fn get_snapshot(
         &self,
         request: Request<proto::SnapshotRequest>,
     ) -> Result<Response<proto::Snapshot>, Status> {
-        if !self.scopes.contains(&Scope::Replication) {
-            return self.unserved(Call::GetSnapshot, &request);
-        }
-        self.admit(Call::GetSnapshot, &request)?;
-        let now = Instant::now();
-        let term = self.leading(now)?;
-        self.shared
-            .replication
-            .snapshot(term, &self.shared.controller_id, now)
-            .map(Response::new)
+        self.unserved(Call::GetSnapshot, &request)
     }
 
     async fn explain(
@@ -1211,7 +1200,7 @@ mod tests {
             ("RegisterWorker", &[Scope::Control]),
             ("PatchWorker", &[Scope::Control]),
             ("DeregisterWorker", &[Scope::Control]),
-            ("GetSnapshot", &[Scope::Control, Scope::Replication]),
+            ("GetSnapshot", &[Scope::Control]),
             ("Explain", &[Scope::Control]),
             ("ApplyPolicySpec", &[Scope::Control]),
             ("GetPolicySpec", &[Scope::Control]),
@@ -1300,13 +1289,14 @@ mod tests {
         assert_eq!(unplaced.code(), Code::Unauthenticated);
         assert_eq!(unplaced.message(), NO_PRINCIPAL);
 
-        // The snapshot: the operators' read is unserved; a standby's
-        // re-sync base is the leader's to answer.
+        // The snapshot is the operators' read, unserved. A standby is
+        // restored on its Replicate stream: the replication scope does not
+        // make the call.
         let snapshot = || from("standby-a", proto::SnapshotRequest::default());
         for (listener, code) in [
             (&gateway, Code::PermissionDenied),
             (&control, Code::Unimplemented),
-            (&replication, Code::FailedPrecondition),
+            (&replication, Code::PermissionDenied),
         ] {
             let status = listener
                 .get_snapshot(snapshot())
@@ -1481,16 +1471,14 @@ mod tests {
 
     /// The calls a step serves, beside `Leader`, each with its refusal by a
     /// replica that never took the lease: a write is the leader's alone, as
-    /// are a standby's batches and, on the replication scope alone, the
-    /// snapshot; a watch of the rows is a standby's once it follows the
-    /// leader's log, which none does in this build.
-    fn refused_off_the_leader(call: Call, scopes: &[Scope]) -> Option<(Code, &'static str)> {
+    /// are a standby's batches; a watch of the rows is a standby's once it
+    /// follows the leader's log, which none does in this build.
+    fn refused_off_the_leader(call: Call) -> Option<(Code, &'static str)> {
         const NOT_LEADING: (Code, &str) = (Code::FailedPrecondition, "this replica does not lead");
         match call {
             Call::RegisterWorker | Call::PatchWorker | Call::DeregisterWorker | Call::Replicate => {
                 Some(NOT_LEADING)
             }
-            Call::GetSnapshot if scopes.contains(&Scope::Replication) => Some(NOT_LEADING),
             Call::WatchWorkers => Some((Code::Unavailable, super::FOLLOWS_NO_LOG)),
             _ => None,
         }
@@ -1605,7 +1593,7 @@ mod tests {
                         "request_id is out of its range in this protocol version".to_owned(),
                     )
                 } else if layer == Layer::AsTold && stated {
-                    match call.and_then(|call| refused_off_the_leader(call, scopes)) {
+                    match call.and_then(refused_off_the_leader) {
                         Some((code, why)) => (code, why.to_owned()),
                         None => (
                             Code::Unimplemented,
@@ -2166,13 +2154,14 @@ mod tests {
 
     /// A take at or below a term the log followed starts no term in it: the
     /// replica holds the lease and its store's writes stand under no term.
-    /// A watch's open, a registration, a patch, a removal and the snapshot
-    /// are refused then, `UNAVAILABLE`, and the words say that it lasts the
-    /// lead.
+    /// A watch's open, a registration, a patch and a removal are refused
+    /// then, `UNAVAILABLE`, and the words say that it lasts the lead. The
+    /// snapshot call is served to no caller by this build, whatever the
+    /// term: a standby's restore rides its stream, refused below.
     #[tokio::test]
-    async fn a_take_that_started_no_term_serves_no_watch_membership_or_snapshot_call() {
+    async fn a_take_that_started_no_term_serves_no_watch_or_membership_call() {
         for followed in [1, 5] {
-            let scopes = [Scope::Gateway, Scope::Control, Scope::Replication];
+            let scopes = [Scope::Gateway, Scope::Control];
             let (mut elector, _standing, service) = service_alone(&scopes);
             // The log followed a term: a restart at a snapshot's place of
             // it. The take is of term 1, and the store is told it.
@@ -2211,8 +2200,6 @@ mod tests {
             refused(service.patch_worker(patch).await.err(), "a patch");
             let removal = from("operator-a", proto::DeregisterWorkerRequest::default());
             refused(service.deregister_worker(removal).await.err(), "a removal");
-            let snapshot = from("standby-a", proto::SnapshotRequest::default());
-            refused(service.get_snapshot(snapshot).await.err(), "the snapshot");
             assert_eq!(service.shared.feed.log.head(Kinds::Watched), place);
         }
     }
