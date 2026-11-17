@@ -829,6 +829,24 @@ impl SpanDuty {
     }
 }
 
+/// Makes `subscriber` this thread's default until the guard is dropped, for a
+/// test that reads what its own request wrote.
+///
+/// A callsite keeps the interest its first registration computed. While one
+/// dispatcher is alive in the process, tracing-core computes it from the
+/// registering thread's own default. A callsite that another test's thread
+/// meets first, with no subscriber of its own, is then disabled for this
+/// thread too: its span is never entered and its events are never written.
+/// So the guard holds a second, empty dispatcher: with two alive, a
+/// registration asks every live dispatcher, this thread's among them.
+#[cfg(test)]
+fn subscribed(
+    subscriber: impl tracing::Subscriber + Send + Sync + 'static,
+) -> (tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+    let spare = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    (tracing::subscriber::set_default(subscriber), spare)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -867,9 +885,7 @@ mod tests {
     #[tokio::test]
     async fn a_streamed_body_does_not_enter_the_request_span_per_frame() {
         let enters = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            Registry::default().with(EnterCounter(enters.clone())),
-        );
+        let _guard = subscribed(Registry::default().with(EnterCounter(enters.clone())));
         let frames = 64usize;
         let app = Router::new()
             .route(
@@ -908,6 +924,24 @@ mod tests {
         );
     }
 
+    /// Why `subscribed` holds its second dispatcher, read alone in a process:
+    /// a callsite first met on a thread with no subscriber, after this
+    /// thread took its own, still reaches this thread's subscriber.
+    #[test]
+    fn a_callsite_first_met_on_another_thread_reaches_this_threads_subscriber() {
+        fn span_is_live() -> bool {
+            !tracing::info_span!("first met on another thread").is_disabled()
+        }
+        let _guard = subscribed(Registry::default());
+        std::thread::spawn(span_is_live)
+            .join()
+            .expect("the other thread");
+        assert!(
+            span_is_live(),
+            "the callsite reads this thread's subscriber as absent"
+        );
+    }
+
     /// Counts the events of one level on this thread's subscriber.
     struct LevelCounter(tracing::Level, Arc<AtomicUsize>);
 
@@ -928,7 +962,7 @@ mod tests {
     #[tokio::test]
     async fn a_reported_refusal_is_not_logged_again_at_error() {
         let errors = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
+        let _guard = subscribed(
             Registry::default().with(LevelCounter(tracing::Level::ERROR, errors.clone())),
         );
         let refused = || async {
@@ -1023,7 +1057,7 @@ mod tests {
     #[tokio::test]
     async fn the_access_log_carries_the_path_without_the_query_string() {
         let fields = Fields::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(fields.clone()));
+        let _guard = subscribed(Registry::default().with(fields.clone()));
         let app = Router::new()
             .route("/v1/models", get(|| async { "ok" }))
             .layer(create_logging_layer(AccessLogFields::NONE))
@@ -1489,7 +1523,7 @@ mod field_tests {
     #[tokio::test]
     async fn the_default_record_keeps_its_fields_under_the_json_format() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _guard = subscribed(json_subscriber(&capture));
         let response = app(AccessLogFields::NONE, None)
             .oneshot(request("/v1/chat/completions"))
             .await
@@ -1516,7 +1550,7 @@ mod field_tests {
     #[tokio::test]
     async fn the_latency_runs_from_the_edge_s_entry_stamp() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _guard = subscribed(json_subscriber(&capture));
         let app = Router::new()
             .route("/v1/chat/completions", post(|| async { "ok" }))
             .layer(create_logging_layer(AccessLogFields::NONE));
@@ -1547,7 +1581,7 @@ mod field_tests {
     #[tokio::test]
     async fn every_selected_field_is_on_the_finish_line_under_the_json_format() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _guard = subscribed(json_subscriber(&capture));
         let response = app(AccessLogFields::all(), None)
             .oneshot(request("/v1/chat/completions"))
             .await
@@ -1594,7 +1628,7 @@ mod field_tests {
     async fn a_streamed_response_gets_its_bytes_on_an_end_line() {
         for (fields, expected_lines) in [(AccessLogFields::all(), 3), (AccessLogFields::NONE, 2)] {
             let capture = Capture::default();
-            let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+            let _guard = subscribed(json_subscriber(&capture));
             let frames = futures::stream::iter(
                 (0..3).map(|_| Ok::<_, Infallible>(Bytes::from_static(FRAME))),
             );
@@ -1634,7 +1668,7 @@ mod field_tests {
     #[tokio::test(start_paused = true)]
     async fn a_keep_alive_frame_counts_in_the_streamed_bytes() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _guard = subscribed(json_subscriber(&capture));
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = app(
             AccessLogFields::all(),
@@ -1674,7 +1708,7 @@ mod field_tests {
     #[tokio::test]
     async fn a_client_that_leaves_mid_stream_gets_the_bytes_out_so_far() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+        let _guard = subscribed(json_subscriber(&capture));
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = app(
             AccessLogFields::all(),
@@ -1712,7 +1746,7 @@ mod field_tests {
     #[tokio::test]
     async fn a_declared_body_cut_short_keeps_the_length_once_and_adds_the_bytes_sent() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(text_subscriber(&capture));
+        let _guard = subscribed(text_subscriber(&capture));
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = app(
             AccessLogFields::all(),
@@ -1761,7 +1795,7 @@ mod field_tests {
     #[tokio::test]
     async fn a_stream_that_fails_keeps_the_length_once_and_adds_the_bytes_sent() {
         let capture = Capture::default();
-        let _guard = tracing::subscriber::set_default(text_subscriber(&capture));
+        let _guard = subscribed(text_subscriber(&capture));
         let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
         let response = app(
             AccessLogFields::all(),
@@ -1812,7 +1846,7 @@ mod field_tests {
             (AccessLogFields::all(), true),
         ] {
             let capture = Capture::default();
-            let _guard = tracing::subscriber::set_default(text_subscriber(&capture));
+            let _guard = subscribed(text_subscriber(&capture));
             let response = app(fields, None)
                 .oneshot(request("/v1/chat/completions"))
                 .await
