@@ -4043,7 +4043,10 @@ async fn non_streamed_requests_cut_at_the_request_timeout_count_against_the_work
             None,
         )
     });
-    for response in futures::future::join_all(at_once).await {
+    let responses = tokio::time::timeout(CASE_CAP, futures::future::join_all(at_once))
+        .await
+        .expect("the request timeout answers: without it the gateway waits on the silent worker as long as the client does");
+    for response in responses {
         assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
     }
     assert_eq!(
@@ -4122,8 +4125,9 @@ async fn a_decode_side_cut_at_the_request_timeout_is_a_failure_for_the_decode_wo
         .expect("completion pipeline");
     let components = components(Arc::clone(&worker_registry)).await;
 
-    let response = pipeline
-        .execute_completion(
+    let response = tokio::time::timeout(
+        CASE_CAP,
+        pipeline.execute_completion(
             completion(false),
             None,
             MODEL.to_string(),
@@ -4131,8 +4135,10 @@ async fn a_decode_side_cut_at_the_request_timeout_is_a_failure_for_the_decode_wo
             None,
             None,
             None,
-        )
-        .await;
+        ),
+    )
+    .await
+    .expect("the request timeout answers: without it the gateway waits on the silent decode side as long as the client does");
 
     assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
