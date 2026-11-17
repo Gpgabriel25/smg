@@ -3236,6 +3236,9 @@ async fn a_peer_disconnect_fails_accepted_typed_tensor_requests_on_the_tagged_wi
 async fn an_abandoned_typed_tensor_submit_aborts_its_request_on_the_tagged_wire() {
     let (client, mut engine, _ns) = connect_tagged().await;
     client.set_send_timeout(SEND_WINDOW);
+    // The large submit must be queued behind the stalled writer however
+    // late it starts: see `QUEUED_SUBMIT_BYTES`.
+    client.set_input_queue_limit(usize::MAX, QUEUED_SUBMIT_BYTES);
     for _ in 0..3 {
         let (payload, aux) = TokenSpeedProtocol::encode_add(
             &large_tagged_request("queue-saturation"),
