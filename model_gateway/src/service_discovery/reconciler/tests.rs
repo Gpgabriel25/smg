@@ -290,6 +290,36 @@ fn owned_workers_read_back_the_spec_hash() {
     assert!(actions.remove.is_empty());
 }
 
+/// Today's behaviour, held here so that a change of it is a choice and not
+/// an accident: a pass reads no worker state. A worker that left the
+/// published list and is listed again while its removal still drains it
+/// counts as registered, so the pass queues nothing for it. The removal
+/// goes on and removes it, and the first pass after that registers it again.
+#[test]
+fn a_worker_listed_again_while_it_drains_counts_as_registered() {
+    let app_context = create_test_app_context();
+    let worker = published("10.0.0.1:8080", "f-1");
+    register_with_labels(
+        &app_context,
+        "http://10.0.0.1:8080",
+        &[
+            (DISCOVERY_PROVIDER_LABEL, "file"),
+            (DISCOVERY_ID_LABEL, "f-1"),
+            (DISCOVERY_SPEC_HASH_LABEL, &worker.fingerprint()),
+        ],
+    );
+    // What the removal's drain step writes while its window runs.
+    for registered in app_context.worker_registry.get_all() {
+        registered.set_status(openai_protocol::worker::WorkerStatus::Draining);
+    }
+
+    let owned = owned_workers(&app_context, DiscoveryKind::File);
+    assert_eq!(owned.len(), 1);
+    let actions = compute_actions(&desired_state_of(&[worker]), &owned);
+    assert!(actions.add.is_empty());
+    assert!(actions.remove.is_empty());
+}
+
 /// An owned worker missing its fingerprint label cannot be shown current,
 /// so it is updated in place and comes back labelled properly.
 #[test]

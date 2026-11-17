@@ -2,9 +2,12 @@
 //!
 //! Marks each Ready worker as `Draining` so policies stop selecting it,
 //! then sleeps the maximum `drain_settle_secs` across the workers being
-//! removed. Non-Ready workers (Pending, NotReady, Failed) are not
-//! drained — sleeping for them would just delay the cleanup of broken
-//! workers without protecting any in-flight traffic.
+//! removed. A worker another removal already moved to `Draining` is
+//! waited for as well: its window still runs under that removal, and
+//! removing it at once would end the window early. Other non-Ready
+//! workers (Pending, NotReady, Failed) are not drained — sleeping for
+//! them would just delay the cleanup of broken workers without
+//! protecting any in-flight traffic.
 //!
 //! A pinned removal (`WorkerRemovalRequest::expected_revisions`) reads its
 //! pins again here: a worker whose pin moved since the selection is a
@@ -51,7 +54,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
         let registry = &app_context.worker_registry;
         let pins = context.data.config.expected_revisions.as_ref();
         let mut max_drain_secs: u64 = 0;
-        let mut transitioned = 0usize;
+        let mut waited_for = 0usize;
         // The workers that stay the job's. A worker whose pin moved since the
         // selection (replaced under its id, or a registration under its URL)
         // is left out, and the job's lists are rewritten without it below.
@@ -106,16 +109,23 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
             // not written over with `Draining`. The drain window is read
             // there too, from the worker the write lands on.
             let drained = registry.apply_if_revision(&worker_id, revision, |worker| {
-                let ready = worker.status() == WorkerStatus::Ready;
+                let status = worker.status();
                 (
-                    worker.metadata().health_config.drain_settle_secs,
-                    ready.then_some(WorkerStatus::Draining),
+                    (
+                        worker.metadata().health_config.drain_settle_secs,
+                        status == WorkerStatus::Draining,
+                    ),
+                    (status == WorkerStatus::Ready).then_some(WorkerStatus::Draining),
                 )
             });
             match drained {
-                Some((drain_secs, transition)) => {
-                    if transition.is_some() {
-                        transitioned += 1;
+                Some(((drain_secs, draining), transition)) => {
+                    // A worker another removal already moved to `Draining`
+                    // is waited for like one this job drains: its window
+                    // still runs, and a job that went on at once would
+                    // remove the worker before that window has ended.
+                    if transition.is_some() || draining {
+                        waited_for += 1;
                         max_drain_secs = max_drain_secs.max(drain_secs);
                     }
                     kept.push(Arc::clone(snapshot));
@@ -147,14 +157,14 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
             context.data.keep_only(kept);
         }
 
-        if transitioned == 0 {
-            debug!("Drain step: no Ready workers in batch, skipping drain");
+        if waited_for == 0 {
+            debug!("Drain step: no Ready or Draining workers in batch, skipping drain");
             return Ok(StepResult::Success);
         }
 
         info!(
             "Draining {} worker(s) for {}s before removal",
-            transitioned, max_drain_secs
+            waited_for, max_drain_secs
         );
         tokio::time::sleep(Duration::from_secs(max_drain_secs)).await;
 
@@ -645,5 +655,65 @@ mod tests {
             vec![url.to_string()],
             "the worker stays in the job"
         );
+    }
+
+    /// Two removals of one worker, queued under two keys as a `DELETE`'s and
+    /// a discovery pass's are: the second finds the worker `Draining` under
+    /// the first. It waits the worker's window too, in either order, so the
+    /// worker is not removed before the first removal's window has ended.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_removal_waits_for_a_worker_the_first_is_draining() {
+        // (the first removal is pinned, the second is pinned): a pass's
+        // removal carries the revision it saw, a `DELETE`'s carries none.
+        for (first_pinned, second_pinned) in [(false, true), (true, false)] {
+            let worker = build_worker("http://w1:8080", 20, WorkerStatus::Ready);
+            let app_ctx = make_app_context(&[Arc::clone(&worker)]);
+            let context = |pinned: bool| {
+                let mut ctx = make_context(Arc::clone(&app_ctx), vec![Arc::clone(&worker)]);
+                if pinned {
+                    let id = app_ctx.worker_registry.get_id_by_url(worker.url()).unwrap();
+                    ctx.data.config.expected_revisions = Some(HashMap::from([(
+                        id.as_str().to_string(),
+                        Some(worker.revision()),
+                    )]));
+                }
+                ctx
+            };
+            let (mut first, mut second) = (context(first_pinned), context(second_pinned));
+
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "test-only spawn awaited via the JoinHandle below"
+            )]
+            let first_step =
+                tokio::spawn(async move { DrainWorkersStep.execute(&mut first).await });
+            tokio::task::yield_now().await;
+            assert_eq!(worker.status(), WorkerStatus::Draining);
+
+            // The second removal arrives three seconds into the window.
+            tokio::time::advance(Duration::from_secs(3)).await;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "test-only spawn awaited via the JoinHandle below"
+            )]
+            let second_step =
+                tokio::spawn(async move { DrainWorkersStep.execute(&mut second).await });
+            tokio::task::yield_now().await;
+            assert!(
+                !second_step.is_finished(),
+                "the second removal went on at once (first pinned: {first_pinned})"
+            );
+
+            // One second before the first removal's window ends, both wait.
+            tokio::time::advance(Duration::from_secs(16)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !first_step.is_finished() && !second_step.is_finished(),
+                "a removal went on inside the drain window (first pinned: {first_pinned})"
+            );
+
+            assert_eq!(first_step.await.unwrap().unwrap(), StepResult::Success);
+            assert_eq!(second_step.await.unwrap().unwrap(), StepResult::Success);
+        }
     }
 }
