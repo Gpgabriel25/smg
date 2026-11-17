@@ -497,17 +497,18 @@ pub(crate) async fn resolve_media(
             return reported(invalid_multimodal_request(e));
         }
         // Every other failure is the deployment's (the hub, the model's
-        // files, its vocabulary): the line stays ERROR and the answer
-        // unmarked. The chain, not the outermost context alone: a hub
-        // failure's cause (the file, the hub's answer, its address) is
-        // answered generically below and lives here.
+        // files, its vocabulary): the line stays ERROR and the answer is
+        // unmarked, in the server's class. The chain, not the outermost
+        // context alone: the cause (the file, the token, the hub's answer
+        // and its address) is answered generically below and lives here.
         error!(
             function = stage,
             model = %model_id,
             error = %format!("{e:#}"),
             "Failed to prepare the multimodal prompt plan"
         );
-        multimodal::config_unavailable_response(&e).unwrap_or_else(|| invalid_multimodal_request(e))
+        multimodal::config_unavailable_response(&e)
+            .unwrap_or_else(multimodal::preparation_fault_response)
     })?;
     // A model without a media spec is served where its template takes
     // content parts and writes the engine's own placeholders. A template

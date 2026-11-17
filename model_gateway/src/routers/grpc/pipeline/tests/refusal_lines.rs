@@ -105,33 +105,41 @@ async fn media_the_preparation_refuses_is_one_warn_and_marked() {
     );
 }
 
-/// A fault of the deployment in the same preparation, whose 400 names `cause`: the stage's line
-/// stays ERROR and the answer unmarked, so an operator still reads it.
+/// A fault of the deployment in the same preparation is answered in the server's class: a 500
+/// under the pipeline's own code, whose sentence does not carry `cause`. The stage's line
+/// stays ERROR and the answer unmarked, so an operator still reads it, and the pipeline adds
+/// its own line as for every failure of that class.
 async fn a_deployment_fault_keeps_the_stages_error_line(config: &str, cause: &str) {
     let (response, lines) = image_answer_over_model_config(config).await;
 
-    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
         error::extract_error_code_from_response(&response),
-        "invalid_multimodal_request"
+        "multimodal_processing_failed"
     );
     assert!(!marked(&response));
+    assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(
-        lines,
-        [(
+        lines[0],
+        (
             Level::ERROR,
             "Failed to prepare the multimodal prompt plan".to_string()
-        )]
+        )
+    );
+    assert!(
+        lines[1].0 == Level::ERROR && lines[1].1.starts_with("Stage "),
+        "{lines:?}"
     );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("the answer's body");
     let body = String::from_utf8_lossy(&body);
-    assert!(body.contains(cause), "{body}");
+    assert!(!body.contains(cause), "{body}");
+    assert!(body.contains("the request is not at fault"), "{body}");
 }
 
 /// Media to a model whose configuration this host cannot load (a `config.json` that does not
-/// parse) is the deployment's to fix, though its answer is a 400.
+/// parse) is the deployment's to fix, and its answer is a 500.
 #[tokio::test]
 async fn media_of_a_model_whose_config_cannot_be_loaded_keeps_the_stages_error_line() {
     a_deployment_fault_keeps_the_stages_error_line("{", "Failed to parse config.json").await;

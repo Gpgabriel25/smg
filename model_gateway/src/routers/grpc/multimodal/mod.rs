@@ -186,7 +186,6 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 /// of a modality the model does not take. A configuration file the model's
 /// hub failed to serve is answered by [`config_unavailable_response`].
 pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
-    const PIPELINE_CODE: &str = "multimodal_processing_failed";
     let message = processing_failed_message(error);
     if encoder_budget::ItemOverEncoderBudget::is(error) {
         return error::bad_request(encoder_budget::ITEM_OVER_ENCODER_BUDGET_CODE, message);
@@ -251,6 +250,25 @@ pub(crate) fn config_unavailable_response(error: &anyhow::Error) -> Option<Respo
              retry the request",
         )
     })
+}
+
+/// The code of a failure of the media pipeline that has no code of its own.
+const PIPELINE_CODE: &str = "multimodal_processing_failed";
+
+/// The client's answer when the placeholder preparation fails for a cause
+/// the request did not bring and no hub answers for: the model's
+/// configuration cannot be read or parsed on this host, a spec's media
+/// limits or its placeholder token cannot be resolved from the model's
+/// files, the tokenizer's vocabulary lacks the token. A 500 under the
+/// pipeline's own code with a generic message: a client cannot fix it by
+/// its request, and the cause (the file, the token) is for the log at the
+/// call site.
+pub(crate) fn preparation_fault_response() -> Response {
+    error::internal_error(
+        PIPELINE_CODE,
+        "The gateway could not prepare media processing for this model; \
+         the request is not at fault",
+    )
 }
 
 /// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
