@@ -803,7 +803,8 @@ pub(super) async fn handle_simple_streaming_passthrough(
 /// What one relayed upstream stream ended with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayEnd {
-    /// The model finished without asking for a tool.
+    /// The stream ended with no call waiting in the handler: the model's
+    /// answer, or the end of a turn whose calls the loop has run.
     Answered,
     /// The handler holds complete tool calls; the loop executes them.
     ToolCalls,
@@ -825,13 +826,17 @@ struct RelayFlags {
 /// the handler and is forwarded, buffered or dropped as it says; the MCP
 /// list-tools items (the loop's, built once with its session; none without
 /// one) go out at the first `in_progress` of the first stream; a tool-call
-/// trigger ends the relay with the calls pending in the handler.
+/// trigger ends the relay with the calls pending in the handler. The caller
+/// runs them and relays the same stream again: `chunk_processor` keeps the
+/// blocks this relay split off and did not read, so the next relay goes on
+/// from where this one stopped.
 #[expect(
     clippy::too_many_arguments,
     reason = "The relay reads the loop's client side as the loop's own text did (the sender, the encoder, the sequence number) beside the handler and its two flags; a struct for one call would be a type the loop's other phases do not share."
 )]
 async fn relay_upstream_stream(
     upstream_stream: &mut (impl Stream<Item = reqwest::Result<Bytes>> + Unpin),
+    chunk_processor: &mut ChunkProcessor,
     handler: &mut StreamingToolHandler,
     flags: &mut RelayFlags,
     list_tools_items: &[Value],
@@ -840,9 +845,11 @@ async fn relay_upstream_stream(
     streaming_ctx: &StreamingEventContext<'_>,
     sequence_number: &mut u64,
 ) -> RelayEnd {
-    let mut chunk_processor = ChunkProcessor::new();
     let mut seen_in_progress = false;
-    while let Some(chunk_result) = upstream_stream.next().await {
+    // An empty chunk first: the blocks an earlier relay of this turn left in
+    // the processor are read before the stream is awaited again.
+    let mut chunk_result: reqwest::Result<Bytes> = Ok(Bytes::new());
+    loop {
         match chunk_result {
             Ok(chunk) => {
                 chunk_processor.push_chunk(&chunk);
@@ -852,6 +859,14 @@ async fn relay_upstream_stream(
                     let (event_name, data) = parse_sse_block(raw_block);
 
                     if data.is_empty() {
+                        continue;
+                    }
+
+                    // The upstream's end sentinel closes the upstream's
+                    // stream, not the client's. In a turn that handed calls
+                    // to the loop another turn follows, so the sentinel is
+                    // not passed through.
+                    if data == "[DONE]" && handler.handed_over_calls() {
                         continue;
                     }
 
@@ -947,7 +962,11 @@ async fn relay_upstream_stream(
                             // is the LAST event for a given item.
                             // Unlike `ExecuteTools`, this does NOT
                             // kick the tool loop — there is no
-                            // dispatched call to finish.
+                            // dispatched call to finish. The same
+                            // holds for the upstream's own
+                            // `output_item.done` of a call the loop
+                            // took already: the loop writes that
+                            // call's umbrella itself.
                         }
                         StreamAction::ExecuteTools {
                             forward_triggering_event,
@@ -990,6 +1009,10 @@ async fn relay_upstream_stream(
                 return RelayEnd::Stopped;
             }
         }
+        chunk_result = match upstream_stream.next().await {
+            Some(next) => next,
+            None => break,
+        };
     }
     RelayEnd::Answered
 }
@@ -1060,7 +1083,7 @@ pub(super) fn handle_streaming_with_tool_interception(
         let auth_header =
             provider.extract_auth_header(headers_opt.as_ref(), worker_api_key.as_ref());
 
-        let (handler, end) = loop {
+        let (handler, end) = 'turns: loop {
             // Make streaming request
             let mut request_builder = client_clone.post(&url_clone).json(&current_payload);
             request_builder = provider.apply_headers(request_builder, auth_header.as_ref());
@@ -1097,91 +1120,108 @@ pub(super) fn handle_streaming_with_tool_interception(
             if let Some(ref id) = preserved_response_id {
                 handler.original_response_id = Some(id.clone());
             }
-            let end = relay_upstream_stream(
-                &mut upstream_stream,
-                &mut handler,
-                &mut flags,
-                state.mcp_list_tools_items(&session),
-                &tx,
-                &mut sse_encoder,
-                &streaming_ctx,
-                &mut sequence_number,
-            )
-            .await;
-            if end == RelayEnd::Stopped {
-                return;
-            }
+            // One upstream turn. The relay hands over at each complete call,
+            // the call runs, and the relay reads the same stream on from
+            // where it stopped: a turn that asks for several tools is served
+            // call by call in this one round trip, and the model is not asked
+            // for the rest again.
+            let mut chunk_processor = ChunkProcessor::new();
+            let mut calls_ran = false;
+            loop {
+                let end = relay_upstream_stream(
+                    &mut upstream_stream,
+                    &mut chunk_processor,
+                    &mut handler,
+                    &mut flags,
+                    state.mcp_list_tools_items(&session),
+                    &tx,
+                    &mut sse_encoder,
+                    &streaming_ctx,
+                    &mut sequence_number,
+                )
+                .await;
+                if end == RelayEnd::Stopped {
+                    return;
+                }
 
-            next_output_index = handler.next_output_index();
-            if let Some(id) = handler.original_response_id().map(|s| s.to_string()) {
-                preserved_response_id = Some(id);
-            }
+                next_output_index = handler.next_output_index();
+                if let Some(id) = handler.original_response_id().map(|s| s.to_string()) {
+                    preserved_response_id = Some(id);
+                }
 
-            // The model answered without asking for a tool: the loop's end.
-            if end == RelayEnd::Answered {
-                break (handler, ToolLoopEnd::Answered);
-            }
+                // The stream's end: this turn has nothing more to hand over.
+                if end == RelayEnd::Answered {
+                    break;
+                }
+                calls_ran = true;
 
-            // Execute tools
-            let mut pending_calls = handler.take_pending_calls();
+                // Execute tools
+                let mut pending_calls = handler.take_pending_calls();
 
-            // Check iteration limit
-            state.iteration += 1;
-            state.total_calls += pending_calls.len();
+                // Check iteration limit
+                state.iteration += 1;
+                state.total_calls += pending_calls.len();
 
-            // Record tool loop iteration metric
-            Metrics::record_mcp_tool_iteration(&original_request.model);
+                // Record tool loop iteration metric
+                Metrics::record_mcp_tool_iteration(&original_request.model);
 
-            let effective_limit = match max_tool_calls {
-                Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
-                None => DEFAULT_MAX_ITERATIONS,
-            };
+                let effective_limit = match max_tool_calls {
+                    Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
+                    None => DEFAULT_MAX_ITERATIONS,
+                };
 
-            // The calls that fit the request's remaining allowance run, as
-            // the non-streamed loop runs them; the rest of the batch is the
-            // stop, the loop's end before an answer.
-            let over_limit = state.total_calls.saturating_sub(effective_limit);
-            let skipped = pending_calls.split_off(pending_calls.len().saturating_sub(over_limit));
+                // The calls that fit the request's remaining allowance run, as
+                // the non-streamed loop runs them; the rest of the batch is the
+                // stop, the loop's end before an answer.
+                let over_limit = state.total_calls.saturating_sub(effective_limit);
+                let skipped =
+                    pending_calls.split_off(pending_calls.len().saturating_sub(over_limit));
 
-            // Execute all pending tool calls. Pass the caller-declared tools so
-            // hosted-tool overrides (e.g. image_generation size/quality) are
-            // merged into dispatch args before MCP execution. The request-level
-            // `user` is also forwarded into hosted-tool dispatch args.
-            if !execute_streaming_tool_calls(
-                pending_calls,
-                &session,
-                &format_registry,
-                &tx,
-                &mut state,
-                &mut sequence_number,
-                &original_request.model,
-                original_request.tools.as_deref().unwrap_or(&[]),
-                original_request.user.as_deref(),
-            )
-            .await
-            {
-                return;
-            }
-
-            if !skipped.is_empty() {
-                warn!(
-                    effective_limit,
-                    skipped = skipped.len(),
-                    "Reached the tool call limit during streaming: the remaining calls are not executed"
-                );
-                if !skip_streaming_tool_calls(
-                    skipped,
+                // Execute all pending tool calls. Pass the caller-declared tools so
+                // hosted-tool overrides (e.g. image_generation size/quality) are
+                // merged into dispatch args before MCP execution. The request-level
+                // `user` is also forwarded into hosted-tool dispatch args.
+                if !execute_streaming_tool_calls(
+                    pending_calls,
                     &session,
                     &format_registry,
                     &tx,
                     &mut state,
                     &mut sequence_number,
+                    &original_request.model,
+                    original_request.tools.as_deref().unwrap_or(&[]),
+                    original_request.user.as_deref(),
                 )
                 .await
                 {
                     return;
                 }
-                break (handler, ToolLoopEnd::ToolCallLimit);
+
+                if !skipped.is_empty() {
+                    warn!(
+                        effective_limit,
+                        skipped = skipped.len(),
+                        "Reached the tool call limit during streaming: the remaining calls are not executed"
+                    );
+                    if !skip_streaming_tool_calls(
+                        skipped,
+                        &session,
+                        &format_registry,
+                        &tx,
+                        &mut state,
+                        &mut sequence_number,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    break 'turns (handler, ToolLoopEnd::ToolCallLimit);
+                }
+            }
+
+            // The model answered without asking for a tool: the loop's end.
+            if !calls_ran {
+                break (handler, ToolLoopEnd::Answered);
             }
 
             // The next turn's payload: this one, the calls just executed
@@ -1838,6 +1878,7 @@ mod tests {
         let relay = async {
             let end = relay_upstream_stream(
                 &mut upstream,
+                &mut ChunkProcessor::new(),
                 handler,
                 flags,
                 &[],
@@ -1945,6 +1986,277 @@ mod tests {
         assert_eq!(end, RelayEnd::ToolCalls);
         assert_eq!(unread, 1, "the completed after the trigger is not read");
         assert_eq!(handler.take_pending_calls().len(), 1);
+    }
+
+    const CALL_ITEM_DONE: &str = "event: response.output_item.done\ndata: {\"type\":\
+                                  \"response.output_item.done\",\"sequence_number\":3,\
+                                  \"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\
+                                  \"fc_1\",\"call_id\":\"call_1\",\"name\":\"lookup\",\
+                                  \"arguments\":\"{}\",\"status\":\"completed\"}}";
+    const SECOND_CALL_ADDED: &str = "event: response.output_item.added\ndata: {\"type\":\
+                                     \"response.output_item.added\",\"sequence_number\":4,\
+                                     \"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\
+                                     \"fc_2\",\"call_id\":\"call_2\",\"name\":\"lookup\",\
+                                     \"arguments\":\"\"}}";
+    const SECOND_CALL_DONE: &str = "event: response.function_call_arguments.done\ndata: {\"type\":\
+                                    \"response.function_call_arguments.done\",\"sequence_number\":5,\
+                                    \"item_id\":\"fc_2\",\"output_index\":1,\"arguments\":\"{}\"}";
+    const SECOND_CALL_ITEM_DONE: &str = "event: response.output_item.done\ndata: {\"type\":\
+                                         \"response.output_item.done\",\"sequence_number\":6,\
+                                         \"output_index\":1,\"item\":{\"type\":\"function_call\",\
+                                         \"id\":\"fc_2\",\"call_id\":\"call_2\",\"name\":\"lookup\",\
+                                         \"arguments\":\"{}\",\"status\":\"completed\"}}";
+    /// One upstream turn that asks for two tools, each call streamed whole
+    /// before the next opens, the way the public API streams a turn. It ends
+    /// with the end sentinel some upstreams send after every stream.
+    const TWO_CALL_TURN: [&str; 10] = [
+        CREATED,
+        IN_PROGRESS,
+        CALL_ADDED,
+        CALL_DONE,
+        CALL_ITEM_DONE,
+        SECOND_CALL_ADDED,
+        SECOND_CALL_DONE,
+        SECOND_CALL_ITEM_DONE,
+        COMPLETED,
+        "data: [DONE]",
+    ];
+
+    /// Relays one upstream turn the way the loop does: again on the same
+    /// stream and processor after every hand-over, the pending calls taken
+    /// each time, until the relay ends with no call. Returns the call ids of
+    /// each hand-over and the frames the client read.
+    async fn relayed_turn(
+        upstream: &mut (impl Stream<Item = reqwest::Result<Bytes>> + Unpin),
+    ) -> (Vec<Vec<String>>, Vec<String>) {
+        let request = ResponsesRequest {
+            model: "m".to_string(),
+            input: ResponseInput::Text("hi".to_string()),
+            ..Default::default()
+        };
+        let ctx = StreamingEventContext {
+            original_request: &request,
+            previous_response_id: None,
+            session: None,
+            mcp_format_registry: None,
+        };
+        let (tx, mut rx) = sse_channel();
+        let mut encoder = SseEncoder::new();
+        let mut sequence_number = 0;
+        let mut flags = RelayFlags {
+            first_iteration: true,
+            mcp_list_tools_sent: false,
+        };
+        let mut handler = StreamingToolHandler::with_starting_index(0);
+        let mut chunk_processor = ChunkProcessor::new();
+        let relay = async {
+            let mut handed_over = Vec::new();
+            loop {
+                let end = relay_upstream_stream(
+                    &mut *upstream,
+                    &mut chunk_processor,
+                    &mut handler,
+                    &mut flags,
+                    &[],
+                    &tx,
+                    &mut encoder,
+                    &ctx,
+                    &mut sequence_number,
+                )
+                .await;
+                if end != RelayEnd::ToolCalls {
+                    assert_eq!(end, RelayEnd::Answered);
+                    break;
+                }
+                let calls = handler.take_pending_calls();
+                handed_over.push(calls.into_iter().map(|call| call.call_id).collect());
+            }
+            drop(tx);
+            handed_over
+        };
+        let read = async {
+            let mut frames = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                let frame = frame.expect("a frame");
+                frames.push(String::from_utf8(frame.to_vec()).expect("utf-8"));
+            }
+            frames
+        };
+        tokio::join!(relay, read)
+    }
+
+    /// One upstream turn that asks for two tools is handed over call by
+    /// call: the first relay ends at the first call with that call alone
+    /// pending; the next, on the same stream, drops the upstream's own
+    /// `output_item.done` of the call the loop took, opens the second call
+    /// and hands it over; the last ends at the stream's end with nothing
+    /// pending. The client reads the first call's events before the second
+    /// call's, no closing event of the upstream's, no `response.completed`
+    /// of the upstream's and not its end sentinel. It reads the same when the whole turn comes in one
+    /// chunk: the blocks a relay left in the processor are the next relay's
+    /// first.
+    #[tokio::test]
+    async fn a_turn_of_two_calls_is_handed_over_call_by_call_from_one_stream() {
+        for one_chunk in [false, true] {
+            let frames: Vec<reqwest::Result<Bytes>> = if one_chunk {
+                vec![Ok(Bytes::from(TWO_CALL_TURN.join("\n\n") + "\n\n"))]
+            } else {
+                TWO_CALL_TURN
+                    .iter()
+                    .map(|block| Ok(Bytes::from(format!("{block}\n\n"))))
+                    .collect()
+            };
+            let mut upstream = futures_util::stream::iter(frames);
+            let (handed_over, wire) = relayed_turn(&mut upstream).await;
+            assert_eq!(
+                handed_over,
+                [vec!["call_1".to_string()], vec!["call_2".to_string()]],
+                "in one chunk: {one_chunk}"
+            );
+            let events: Vec<(&str, Option<u64>)> = wire
+                .iter()
+                .map(|frame| {
+                    let name = frame
+                        .lines()
+                        .find_map(|line| line.strip_prefix("event: "))
+                        .unwrap_or_default();
+                    let index = frame
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                        .and_then(|data| data["output_index"].as_u64());
+                    (name, index)
+                })
+                .collect();
+            assert!(
+                !events.iter().any(|(name, _)| {
+                    *name == "response.output_item.done" || *name == "response.completed"
+                }),
+                "in one chunk: {one_chunk}: {events:?}"
+            );
+            assert!(
+                !wire.iter().any(|frame| frame.contains("[DONE]")),
+                "in one chunk: {one_chunk}: {wire:?}"
+            );
+            let indexes: Vec<u64> = events.iter().filter_map(|(_, index)| *index).collect();
+            assert!(
+                indexes.contains(&0) && indexes.contains(&1) && indexes.is_sorted(),
+                "in one chunk: {one_chunk}: {events:?}"
+            );
+        }
+    }
+
+    /// The loop over an upstream turn of two calls: both calls are run in
+    /// the turn's one round trip, in the stream's order, so the next request
+    /// carries both results and the upstream is asked twice in all (the turn
+    /// and the answer). The upstream's own end sentinel after the tool turn
+    /// is not passed on: the client reads one, the loop's, at the end. A loop
+    /// that left the turn at its first call would send the next request with
+    /// one result and never read the second call.
+    #[tokio::test]
+    async fn a_turn_of_two_calls_costs_one_upstream_round_trip() {
+        use std::sync::{Arc, Mutex};
+
+        use axum::{
+            http::{header::CONTENT_TYPE, StatusCode},
+            routing::any,
+            Json, Router,
+        };
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+        use smg_mcp::McpConfig;
+
+        use crate::{
+            openai::context::StorageHandles, openai_bridge::FormatRegistry,
+            test_support::http_client,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let port = listener.local_addr().expect("an address").port();
+        let tool_turn = TWO_CALL_TURN.join("\n\n") + "\n\n";
+        let answer = [CREATED, IN_PROGRESS, DELTA, COMPLETED].join("\n\n") + "\n\n";
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let seen = Arc::clone(&requests);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub upstream answering one event stream per request; aborted at the test's end"
+        )]
+        let upstream = tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |Json(body): Json<Value>| {
+                let resumed = body["input"].as_array().is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item["type"] == "function_call_output")
+                });
+                seen.lock().expect("the request list").push(body);
+                let text = if resumed {
+                    answer.clone()
+                } else {
+                    tool_turn.clone()
+                };
+                async move { ([(CONTENT_TYPE, "text/event-stream")], text) }
+            }));
+            axum::serve(listener, app).await.expect("the stub serves");
+        });
+
+        let orchestrator = Arc::new(
+            McpOrchestrator::new(McpConfig::default())
+                .await
+                .expect("an orchestrator with no servers"),
+        );
+        let client = http_client();
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+                .expect("a request");
+        let req = StreamingRequest {
+            url: format!("http://127.0.0.1:{port}/v1/responses"),
+            payload: json!({"model": "m", "input": "hi", "stream": true}),
+            original_body: request,
+            previous_response_id: None,
+            existing_mcp_list_tools_labels: Vec::new(),
+            storage: StorageHandles {
+                response: Arc::new(MemoryResponseStorage::new()),
+                conversation: Arc::new(MemoryConversationStorage::new()),
+                conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+                request_context: None,
+                tenant: None,
+            },
+        };
+        let response = handle_streaming_with_tool_interception(
+            &client,
+            None,
+            None,
+            req,
+            &orchestrator,
+            FormatRegistry::new(),
+            Vec::new(),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the stream to its end");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+        upstream.abort();
+
+        let requests = requests.lock().expect("the request list");
+        assert_eq!(requests.len(), 2, "the turn and the answer: {text}");
+        let results: Vec<&str> = requests[1]["input"]
+            .as_array()
+            .expect("an input list")
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .filter_map(|item| item["call_id"].as_str())
+            .collect();
+        assert_eq!(results, ["call_1", "call_2"], "{text}");
+        assert_eq!(
+            text.matches("data: [DONE]").count(),
+            1,
+            "one end sentinel, the loop's own: {text}"
+        );
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
     }
 
     /// A client that is gone before the first frame stops the relay at that
