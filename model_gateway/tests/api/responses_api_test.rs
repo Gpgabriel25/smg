@@ -3363,6 +3363,55 @@ async fn stream_body(router: &dyn smg::routers::RouterTrait, req: ResponsesReque
     String::from_utf8(bytes.to_vec()).expect("utf-8")
 }
 
+/// A tool that runs longer than the request timeout does not fail the
+/// request: the timeout is the deadline of one upstream request, and no
+/// upstream request waits on a tool. The search here takes longer than the
+/// client's deadline for the turn that asked for it, and the stream ends as
+/// the same request ends with a fast tool: the call that fit ran, the one
+/// over the limit is closed, then the terminal. A loop that left the turn's
+/// upstream stream unread while the tool ran would read it again past its
+/// deadline and end the stream with the stream's error.
+#[tokio::test]
+async fn a_tool_that_outruns_the_request_timeout_does_not_fail_the_stream() {
+    use std::{sync::Arc, time::Duration};
+
+    let mut mcp = MockMCPServer::start_with_latency(Duration::from_millis(3500))
+        .await
+        .expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let (_, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+    // The gateway's shared client carries the request timeout as the total
+    // deadline of each upstream request; the test context's client has none.
+    let mut ctx = (*ctx).clone();
+    ctx.client = smg::server::http_client_builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("a client with a deadline");
+    let router = RouterFactory::create_router(&Arc::new(ctx))
+        .await
+        .expect("router");
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), Some(1))).await;
+
+    let events = frame_events(&body);
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !types
+            .iter()
+            .any(|kind| matches!(*kind, "error" | "response.failed")),
+        "{body}"
+    );
+    assert_eq!(types.last().copied(), Some("response.completed"), "{body}");
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    assert_eq!(mcp.call_count(), 1, "the one call that fit ran: {body}");
+    server.abort();
+    mcp.stop().await;
+}
+
 /// An upstream status answered before the first byte of the first turn: the
 /// stream is the one typed error event, the upstream's own code and message,
 /// at sequence number 0; no event name, no sentinel.

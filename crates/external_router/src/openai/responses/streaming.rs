@@ -7,7 +7,15 @@
 //! - MCP tool execution loops within streaming responses
 //! - Event transformation and output index remapping
 
-use std::{borrow::Cow, io, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use axum::{
     body::Body,
@@ -800,6 +808,61 @@ pub(super) async fn handle_simple_streaming_passthrough(
     response
 }
 
+/// One upstream turn's byte stream, read ahead while the turn's tool calls
+/// run. The client that sent the request gives it one deadline, from its
+/// start to the last byte of its body, so a stream left unread while a tool
+/// runs would be read again past that deadline. What `read_during` takes off
+/// the stream waits here in order (the rest of one turn at most) and is
+/// yielded before the stream is polled again.
+struct TurnStream<S> {
+    upstream: S,
+    read_ahead: VecDeque<reqwest::Result<Bytes>>,
+    /// The stream ended or broke under `read_during`: it is not polled
+    /// again.
+    ended: bool,
+}
+
+impl<S: Stream<Item = reqwest::Result<Bytes>> + Unpin> TurnStream<S> {
+    fn new(upstream: S) -> Self {
+        Self {
+            upstream,
+            read_ahead: VecDeque::new(),
+            ended: false,
+        }
+    }
+
+    /// Runs `work` to its end and reads the stream meanwhile.
+    async fn read_during<T>(&mut self, work: impl Future<Output = T>) -> T {
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                output = &mut work => return output,
+                read = self.upstream.next(), if !self.ended => match read {
+                    Some(chunk) => {
+                        self.ended = chunk.is_err();
+                        self.read_ahead.push_back(chunk);
+                    }
+                    None => self.ended = true,
+                },
+            }
+        }
+    }
+}
+
+impl<S: Stream<Item = reqwest::Result<Bytes>> + Unpin> Stream for TurnStream<S> {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(chunk) = self.read_ahead.pop_front() {
+            return Poll::Ready(Some(chunk));
+        }
+        if self.ended {
+            return Poll::Ready(None);
+        }
+        self.upstream.poll_next_unpin(cx)
+    }
+}
+
 /// What one relayed upstream stream ended with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayEnd {
@@ -1115,7 +1178,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 return;
             }
 
-            let mut upstream_stream = response.bytes_stream();
+            let mut upstream_stream = TurnStream::new(response.bytes_stream());
             let mut handler = StreamingToolHandler::with_starting_index(next_output_index);
             if let Some(ref id) = preserved_response_id {
                 handler.original_response_id = Some(id.clone());
@@ -1181,19 +1244,23 @@ pub(super) fn handle_streaming_with_tool_interception(
                 // hosted-tool overrides (e.g. image_generation size/quality) are
                 // merged into dispatch args before MCP execution. The request-level
                 // `user` is also forwarded into hosted-tool dispatch args.
-                if !execute_streaming_tool_calls(
-                    pending_calls,
-                    &session,
-                    &format_registry,
-                    &tx,
-                    &mut state,
-                    &mut sequence_number,
-                    &original_request.model,
-                    original_request.tools.as_deref().unwrap_or(&[]),
-                    original_request.user.as_deref(),
-                )
-                .await
-                {
+                // The turn's stream goes on being read while the calls run:
+                // the upstream request ends when the model ends its turn, so
+                // a tool's run time counts against no request's deadline.
+                let executed = upstream_stream
+                    .read_during(execute_streaming_tool_calls(
+                        pending_calls,
+                        &session,
+                        &format_registry,
+                        &tx,
+                        &mut state,
+                        &mut sequence_number,
+                        &original_request.model,
+                        original_request.tools.as_deref().unwrap_or(&[]),
+                        original_request.user.as_deref(),
+                    ))
+                    .await;
+                if !executed {
                     return;
                 }
 
@@ -2257,6 +2324,51 @@ mod tests {
             "one end sentinel, the loop's own: {text}"
         );
         assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    }
+
+    /// The turn's stream is read while a call runs. The work here ends only
+    /// when the stream has taken what it sends (three chunks through a
+    /// channel of one slot), the way a tool's run outlasts a request's
+    /// deadline on a stream left unread. What was read meanwhile comes out
+    /// afterwards in order, then the stream's end.
+    #[tokio::test]
+    async fn the_turns_stream_is_read_while_a_call_runs() {
+        use tokio::sync::mpsc;
+
+        let (chunks, upstream) = mpsc::channel::<reqwest::Result<Bytes>>(1);
+        let mut stream = TurnStream::new(ReceiverStream::new(upstream));
+        let work = async move {
+            for chunk in ["one", "two", "three"] {
+                chunks
+                    .send(Ok(Bytes::from_static(chunk.as_bytes())))
+                    .await
+                    .expect("a reader");
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_during(work))
+            .await
+            .expect("the work ends once the stream is read");
+        let mut read = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            read.push(chunk.expect("a chunk"));
+        }
+        assert_eq!(read, ["one", "two", "three"]);
+    }
+
+    /// A turn's stream that ended while a call ran is not polled again: the
+    /// client's deadline may have passed by then, and a body read past it
+    /// answers with the deadline's error, not with the end.
+    #[tokio::test]
+    async fn a_turn_stream_that_ended_while_a_call_ran_is_not_polled_again() {
+        let mut polls = 0;
+        let upstream = futures_util::stream::poll_fn(move |_| {
+            polls += 1;
+            assert_eq!(polls, 1, "an ended stream is polled again");
+            Poll::Ready(None::<reqwest::Result<Bytes>>)
+        });
+        let mut stream = TurnStream::new(upstream);
+        stream.read_during(tokio::task::yield_now()).await;
+        assert!(stream.next().await.is_none());
     }
 
     /// A client that is gone before the first frame stops the relay at that
