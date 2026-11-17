@@ -2880,3 +2880,217 @@ async fn test_profile_all_url_filter_without_match() {
     assert!(result.failed.is_empty());
     assert!(result.message.contains("No worker matching"));
 }
+
+/// Feeds the loop's event arm every event the registry has published.
+fn apply_published_events(
+    events: &mut broadcast::Receiver<WorkerEvent>,
+    registry: &Arc<WorkerRegistry>,
+    next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
+    config: &WorkerManagerConfig,
+) {
+    while let Ok(event) = events.try_recv() {
+        assert!(apply_registry_event(Ok(event), registry, next_check, config).is_continue());
+    }
+}
+
+/// A replacement inherits the status of the worker it replaces, so the
+/// `Replaced` event of a draining worker's replacement takes it off the
+/// schedule. The activation that follows is the only notice the loop gets
+/// that the worker serves again.
+#[test]
+fn a_worker_activated_over_a_draining_registration_is_probed_at_once() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let config = test_config();
+    let mut events = registry.subscribe_events();
+    let mut next_check = HashMap::new();
+    let url = "http://relisted:8000";
+    let worker_id = registry
+        .register(probed_worker(url, ConnectionMode::Http))
+        .unwrap();
+    registry.transition_status(&worker_id, WorkerStatus::Ready);
+    registry.transition_status(&worker_id, WorkerStatus::Draining);
+    assert!(registry.replace(&worker_id, probed_worker(url, ConnectionMode::Http)));
+    apply_published_events(&mut events, &registry, &mut next_check, &config);
+    assert!(
+        !next_check.contains_key(&worker_id),
+        "a replacement that reads Draining is off the schedule"
+    );
+
+    registry.transition_status(&worker_id, WorkerStatus::Ready);
+    apply_published_events(&mut events, &registry, &mut next_check, &config);
+
+    let due = next_check
+        .get(&worker_id)
+        .copied()
+        .expect("a worker back in service is probed again");
+    assert!(
+        due <= tokio::time::Instant::now(),
+        "and at once, as a registration is"
+    );
+}
+
+/// The other half: a worker that holds a deadline keeps it through a status
+/// change. Each verdict of the loop publishes one, and a deadline that every
+/// change brought to now would probe a demoted worker back to back instead
+/// of once an interval.
+#[test]
+fn a_status_change_leaves_a_deadline_the_schedule_holds() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let config = test_config();
+    let mut events = registry.subscribe_events();
+    let mut next_check = HashMap::new();
+    let worker_id = registry
+        .register(probed_worker("http://scheduled:8000", ConnectionMode::Http))
+        .unwrap();
+    apply_published_events(&mut events, &registry, &mut next_check, &config);
+    let an_interval_out = tokio::time::Instant::now() + Duration::from_secs(3600);
+    next_check.insert(worker_id.clone(), an_interval_out);
+
+    for status in [
+        WorkerStatus::Ready,
+        WorkerStatus::NotReady,
+        WorkerStatus::Ready,
+    ] {
+        registry.transition_status(&worker_id, status);
+        apply_published_events(&mut events, &registry, &mut next_check, &config);
+        assert_eq!(
+            next_check.get(&worker_id),
+            Some(&an_interval_out),
+            "the change to {status:?} moved a deadline the schedule held"
+        );
+    }
+}
+
+/// One step of a worker's life as the schedule sees it.
+#[derive(Debug, Clone, Copy)]
+enum LifeStep {
+    /// A registration over the worker, which inherits the worker's status.
+    Replace,
+    /// A removal's drain step marks it.
+    Drain,
+    /// An activation, or a probe's verdict, puts it in service.
+    Ready,
+    /// A probe's verdict takes it out.
+    NotReady,
+    /// A probe's verdict fails it.
+    Failed,
+    /// Its deadline comes due and the loop reads its slot.
+    Due,
+}
+
+/// Walks a fresh worker through `steps`, each status written through the
+/// registry as an activation or a drain step writes it, feeds the loop's
+/// event arm after each step, and holds the schedule's rule there: a worker
+/// whose status has a probe slot holds a deadline.
+fn walk_and_hold_the_rule(
+    registry: &Arc<WorkerRegistry>,
+    events: &mut broadcast::Receiver<WorkerEvent>,
+    config: &WorkerManagerConfig,
+    walk: usize,
+    steps: [LifeStep; 4],
+) {
+    let url = format!("http://walked-{walk}:8000");
+    let mut next_check = HashMap::new();
+    let worker_id = registry
+        .register(probed_worker(&url, ConnectionMode::Http))
+        .unwrap();
+    apply_published_events(events, registry, &mut next_check, config);
+    let mut clock = tokio::time::Instant::now();
+    let mut walked = Vec::new();
+    for step in steps {
+        walked.push(step);
+        match step {
+            LifeStep::Replace => {
+                let replacement = probed_worker(&url, ConnectionMode::Http);
+                assert!(registry.replace(&worker_id, replacement));
+            }
+            LifeStep::Drain => {
+                registry.transition_status(&worker_id, WorkerStatus::Draining);
+            }
+            LifeStep::Ready => {
+                registry.transition_status(&worker_id, WorkerStatus::Ready);
+            }
+            LifeStep::NotReady => {
+                registry.transition_status(&worker_id, WorkerStatus::NotReady);
+            }
+            LifeStep::Failed => {
+                registry.transition_status(&worker_id, WorkerStatus::Failed);
+            }
+            LifeStep::Due => {
+                // Past every interval: whatever the schedule holds is due,
+                // and no probe is in flight.
+                clock += Duration::from_secs(2 * 3600);
+                let mut probes: ProbeFutures = FuturesUnordered::new();
+                queue_due_probes(
+                    registry,
+                    config,
+                    &mut next_check,
+                    &mut HashSet::new(),
+                    &mut probes,
+                    clock,
+                );
+            }
+        }
+        apply_published_events(events, registry, &mut next_check, config);
+        let worker = registry
+            .get(&worker_id)
+            .expect("the worker stays registered");
+        let slot = ProbeSlot::of_worker(
+            registry,
+            &worker_id,
+            worker.as_ref(),
+            worker.status(),
+            config,
+        );
+        assert!(
+            !matches!(slot, ProbeSlot::Probe(_)) || next_check.contains_key(&worker_id),
+            "removal {:?}: after {walked:?} the worker reads {:?} and holds no deadline",
+            config.remove_unhealthy,
+            worker.status()
+        );
+    }
+    assert!(registry.remove(&worker_id).is_some());
+    apply_published_events(events, registry, &mut next_check, config);
+}
+
+/// The schedule's rule over every order of four steps of a worker's life,
+/// with failed workers kept and with failed workers removed. `Draining` has
+/// no slot, nor has a failed worker a removal will take: the due pass drops
+/// such a deadline and a replacement writes none, so every way back into a
+/// probed state has to write one. A contact and a probe's own verdict write
+/// the schedule themselves and are not walked.
+#[test]
+fn a_worker_in_a_probed_state_holds_a_deadline_after_any_order_of_steps() {
+    const STEPS: [LifeStep; 6] = [
+        LifeStep::Replace,
+        LifeStep::Drain,
+        LifeStep::Ready,
+        LifeStep::NotReady,
+        LifeStep::Failed,
+        LifeStep::Due,
+    ];
+    for config in [
+        test_config(),
+        config_removing(UnhealthyRemovalScope::AllLocal),
+    ] {
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut events = registry.subscribe_events();
+        let mut walk = 0;
+        for first in STEPS {
+            for second in STEPS {
+                for third in STEPS {
+                    for fourth in STEPS {
+                        walk += 1;
+                        walk_and_hold_the_rule(
+                            &registry,
+                            &mut events,
+                            &config,
+                            walk,
+                            [first, second, third, fourth],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

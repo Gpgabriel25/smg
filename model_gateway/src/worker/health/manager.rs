@@ -358,8 +358,8 @@ type ProbeFutures = FuturesUnordered<Pin<Box<dyn Future<Output = ProbeCompletion
 
 /// What the schedule does with a worker. Decided in one place,
 /// [`ProbeSlot::of`], for every writer of the schedule (the bootstrap and
-/// lag-recovery reconcile, the registration and replacement events, the
-/// connect signal, the due probes) and for the readers that ask whether a
+/// lag-recovery reconcile, the registration, replacement and status events,
+/// the connect signal, the due probes) and for the readers that ask whether a
 /// Failed worker is being removed (the connect signal, the loop after a
 /// probe).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,9 +635,11 @@ async fn run_health_loop(
 }
 
 /// Keeps the schedule in step with the registry: a registered or replaced
-/// worker is probed at once, a removed one leaves the schedule, and a lagged
-/// subscription rebuilds it from a fresh snapshot. `Break` when the registry
-/// is gone and the loop has nothing left to serve.
+/// worker is probed at once, so is a worker whose status moves into a probed
+/// state while the schedule holds no deadline for it, a removed one leaves
+/// the schedule, and a lagged subscription rebuilds it from a fresh
+/// snapshot. `Break` when the registry is gone and the loop has nothing left
+/// to serve.
 fn apply_registry_event(
     event: Result<WorkerEvent, broadcast::error::RecvError>,
     registry: &Arc<WorkerRegistry>,
@@ -669,9 +671,33 @@ fn apply_registry_event(
         Ok(WorkerEvent::Removed { worker_id, .. }) => {
             next_check.remove(&worker_id);
         }
-        Ok(WorkerEvent::StatusChanged { .. }) => {
-            // Self-published; nothing to do.
+        // The loop publishes its own transitions with the deadline armed at
+        // the probe's launch, and a contact's promotion writes one. A status
+        // another writer changes finds none when the worker last read a
+        // state without a slot: the activation of a replacement that
+        // inherited `Draining` puts back in service a worker the schedule
+        // no longer holds.
+        Ok(WorkerEvent::StatusChanged { worker_id, .. })
+            if !next_check.contains_key(&worker_id) =>
+        {
+            if let Some(worker) = registry.get(&worker_id) {
+                let slot = ProbeSlot::of_worker(
+                    registry,
+                    &worker_id,
+                    worker.as_ref(),
+                    worker.status(),
+                    config,
+                );
+                schedule_at(
+                    next_check,
+                    worker_id,
+                    slot,
+                    tokio::time::Instant::now(),
+                    true,
+                );
+            }
         }
+        Ok(WorkerEvent::StatusChanged { .. }) => {}
         Err(broadcast::error::RecvError::Lagged(n)) => {
             warn!("WorkerManager lagged {n} events; rebuilding schedule from registry");
             next_check.clear();
