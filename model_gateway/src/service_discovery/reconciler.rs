@@ -31,7 +31,10 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     observability::metrics::{metrics_labels, Metrics},
-    worker::{identity::endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
+    worker::{
+        identity::endpoint::Endpoint, registry::WorkerId, ConnectionMode, EndpointKey, Worker,
+        WorkerOrigin,
+    },
     workflow::{Job, WorkerRegistrationMode},
 };
 
@@ -97,8 +100,10 @@ pub(super) struct OwnedWorker {
     /// Revision guard for removal: a concurrently replaced worker is skipped
     /// and re-evaluated on the next pass instead of removed blindly.
     pub(super) revision: u64,
-    /// Whether the registration is draining: a removal has taken it out of
-    /// service and has not removed it yet.
+    /// Whether the registration is draining and an addition would bring it
+    /// back: a removal has taken it out of service and has not removed it
+    /// yet. Not set for a worker an addition leaves as it is (see
+    /// [`returns_by_addition`]).
     pub(super) draining: bool,
 }
 
@@ -121,6 +126,16 @@ pub(super) struct RemovalTarget {
     pub(super) discovery_id: Option<String>,
     /// `(worker_id, revision)` as observed in this snapshot, one per rank.
     pub(super) guards: Vec<(WorkerId, u64)>,
+}
+
+/// Whether an addition puts a draining registration of `worker` back in
+/// service. The registration workflow sets a worker it replaced in place
+/// ready again, except one that waits for its backend's handshake (ZMQ):
+/// that one keeps the state it had. For such a worker the pass neither marks
+/// a removal it queues nor reads the draining state, so it leaves and
+/// returns as it did before a pass read that state.
+fn returns_by_addition(worker: &Arc<dyn Worker>) -> bool {
+    *worker.connection_mode() != ConnectionMode::Zmq
 }
 
 /// Snapshot the registry workers this provider owns: locally registered (never
@@ -168,7 +183,7 @@ fn owned_workers(app_context: &AppContext, kind: DiscoveryKind) -> Vec<OwnedWork
                 spec_hash,
                 endpoint,
                 revision: worker.revision(),
-                draining: worker.status() == WorkerStatus::Draining,
+                draining: worker.status() == WorkerStatus::Draining && returns_by_addition(&worker),
             })
         })
         .collect()
@@ -208,13 +223,25 @@ pub(super) struct ReconcileActions {
 ///
 /// A registration that is draining does not make its endpoint current: a
 /// removal has taken it out of service and has not removed it yet. When the
-/// provider publishes the worker again meanwhile and nothing else at the
-/// endpoint is current, the worker is added again. The Upsert replaces the
-/// draining registration in place and puts it back in service, and the
-/// removal, pinned to the registration it selected, then leaves it alone.
+/// provider publishes the worker again meanwhile, the worker is added again,
+/// also where another rank of it still serves: a pass's removal is pinned to
+/// every rank it saw and would take that one too, and a rank whose removal
+/// has ended would otherwise stay out for good. The Upsert replaces each
+/// registration in place and puts the draining one back in service, and the
+/// removal, pinned to the registrations it selected, then leaves them alone.
 /// Left as it was, the worker would be removed when its drain ends and stay
 /// out until the next pass. The draining registration itself is queued for
-/// nothing: the removal that drains it is in flight.
+/// nothing: the addition replaces it.
+///
+/// That state does not wait for the removal's drain step: [`reconcile`] marks
+/// the registrations of an endpoint it no longer finds published as it queues
+/// their removal, so a pass that runs before the job has started reads them
+/// as draining all the same. A removal that ends before its drain step leaves
+/// them marked, and the next pass acts on them as on any draining
+/// registration: while the endpoint stays unpublished it queues the removal
+/// again, and once the worker is published it adds the worker again. A
+/// worker an addition would not bring back is left out of the mark and of
+/// this rule ([`returns_by_addition`]).
 ///
 /// An endpoint no longer published is removed. A DP group yields one removal
 /// per endpoint, carrying a guard for every rank.
@@ -231,9 +258,11 @@ pub(super) fn compute_actions(
         .map(|(key, worker)| (key, worker.fingerprint()))
         .collect();
 
-    // Endpoints with a current registration, and the owned workers that are
-    // not current, each marked with whether it is the published instance.
+    // Endpoints with a current registration, endpoints where a registration
+    // that would be current is draining, and the owned workers that are not
+    // current, each marked with whether it is the published instance.
     let mut has_current: HashSet<EndpointKey> = HashSet::new();
+    let mut drains: HashSet<EndpointKey> = HashSet::new();
     let mut not_current: Vec<(EndpointKey, &OwnedWorker, bool)> = Vec::new();
     for worker in registered {
         let key = worker.endpoint.key();
@@ -242,7 +271,9 @@ pub(super) fn compute_actions(
                 if worker.discovery_id.as_deref() == Some(published.discovery_id.as_str()) =>
             {
                 if worker.spec_hash.as_deref() == fingerprints.get(&key).map(String::as_str) {
-                    if !worker.draining {
+                    if worker.draining {
+                        drains.insert(key);
+                    } else {
                         has_current.insert(key);
                     }
                 } else {
@@ -285,7 +316,7 @@ pub(super) fn compute_actions(
     }
 
     for (key, worker) in &desired.workers {
-        if !has_current.contains(key) {
+        if !has_current.contains(key) || drains.contains(key) {
             actions.add.push(worker.clone());
         }
     }
@@ -342,6 +373,26 @@ fn build_worker_spec(
         .router_config
         .connection_attempt_budget(RouterConfig::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS);
     spec
+}
+
+/// Marks the registrations a queued removal pins as draining: the transition
+/// the removal's drain step writes, from `Ready` alone and at the revision the
+/// job pins. A registration replaced or gone since the pass read it is left
+/// as it is, and so is one an addition would not bring back
+/// ([`returns_by_addition`]). The drain window stays the drain step's,
+/// counted from the job's start.
+fn mark_draining(app_context: &AppContext, target: &RemovalTarget) {
+    for (worker_id, revision) in &target.guards {
+        app_context
+            .worker_registry
+            .apply_if_revision(worker_id, *revision, |worker| {
+                (
+                    (),
+                    (worker.status() == WorkerStatus::Ready && returns_by_addition(worker))
+                        .then_some(WorkerStatus::Draining),
+                )
+            });
+    }
 }
 
 /// One reconcile pass: diff the workers a provider published against the
@@ -448,10 +499,22 @@ pub(super) async fn reconcile(
             ),
         };
         match job_queue.submit(job).await {
-            Ok(()) => Metrics::record_discovery_deregistration(
-                kind.metric_label(),
-                metrics_labels::DEREGISTRATION_RECONCILED,
-            ),
+            Ok(()) => {
+                // An endpoint no longer published leaves service at this pass,
+                // not when its removal reaches the drain step. A pass that runs
+                // in between then reads the worker as draining, so one published
+                // again meanwhile is registered again instead of removed when
+                // its window ends. An address that is still published (another
+                // instance holds it, or a stale sibling goes) stays in service
+                // until the job runs.
+                if !desired.workers.contains_key(&target.endpoint.key()) {
+                    mark_draining(app_context, target);
+                }
+                Metrics::record_discovery_deregistration(
+                    kind.metric_label(),
+                    metrics_labels::DEREGISTRATION_RECONCILED,
+                );
+            }
             Err(e) => error!(
                 "Failed to submit worker removal for {}: {}",
                 target.endpoint.redacted(),

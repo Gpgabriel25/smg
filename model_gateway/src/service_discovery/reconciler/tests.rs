@@ -322,14 +322,14 @@ fn a_worker_listed_again_while_it_drains_is_registered_again() {
     assert!(actions.remove.is_empty());
 }
 
-/// The draining state counts only where the worker is published and nothing
-/// else at its endpoint is current. A DP group whose every rank drains is
-/// registered again with the one add for its endpoint. A rank that drains
-/// beside one that serves is left to the removal that drains it, and a
-/// draining worker that is no longer published keeps its removal and gets
-/// no addition.
+/// The draining state counts only where the worker is published. A DP group
+/// whose every rank drains is registered again with the one add for its
+/// endpoint, and so is a group with a rank that drains beside one that
+/// serves: a pass's removal is pinned to both, and a rank whose removal has
+/// ended would stay out for good. A draining worker that is no longer
+/// published keeps its removal and gets no addition.
 #[test]
-fn a_draining_registration_is_added_again_only_where_nothing_else_is_current() {
+fn a_draining_registration_is_added_again_wherever_its_worker_is_published() {
     let draining_rank = |worker_id: &str, revision| OwnedWorker {
         draining: true,
         ..owned_rank("10.0.0.1:8080", "u1", worker_id, revision)
@@ -346,7 +346,7 @@ fn a_draining_registration_is_added_again_only_where_nothing_else_is_current() {
         draining_rank("w@1", 9),
     ];
     let actions = compute_actions(&desired, &one_rank_serves);
-    assert!(actions.add.is_empty());
+    assert_eq!(actions.add.len(), 1);
     assert!(actions.remove.is_empty());
 
     let actions = compute_actions(&DesiredState::default(), &every_rank_drains);
@@ -416,6 +416,369 @@ async fn a_worker_listed_again_is_queued_beside_the_removal_that_drains_it() {
     assert!(
         in_flight(&url),
         "the registration is queued beside the removal that drains the worker"
+    );
+}
+
+/// A removal's registrations leave service when the pass queues it, not when
+/// its job reaches the drain step: the pass writes the mark itself. So a
+/// worker listed again before the job has started is read as draining at the
+/// next pass, and its registration is queued beside the removal.
+#[tokio::test]
+async fn a_worker_listed_again_before_its_removal_starts_is_registered_again() {
+    use crate::workflow::{JobQueue, JobQueueConfig};
+
+    let app_context = create_test_app_context();
+    // No runner: a queued job never starts.
+    let queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: 4,
+            max_concurrent_jobs: 0,
+        },
+        Arc::downgrade(&app_context),
+    );
+    app_context.worker_job_queue.set(Arc::clone(&queue)).ok();
+    let in_flight = |url: &str| {
+        queue
+            .get_status(url)
+            .is_some_and(|status| matches!(status.status.as_str(), "pending" | "processing"))
+    };
+    let worker = published("http://10.0.0.1:8080", "f-1");
+    register_with_labels(
+        &app_context,
+        "http://10.0.0.1:8080",
+        &[
+            (DISCOVERY_PROVIDER_LABEL, "file"),
+            (DISCOVERY_ID_LABEL, "f-1"),
+            (DISCOVERY_SPEC_HASH_LABEL, &worker.fingerprint()),
+        ],
+    );
+    for registered in app_context.worker_registry.get_all() {
+        registered.set_status(WorkerStatus::Ready);
+    }
+
+    // The worker leaves the published list: the pass queues its removal and
+    // marks the registration.
+    let nothing_published = DesiredState::default();
+    reconcile(
+        &nothing_published,
+        DiscoveryKind::File,
+        &app_context,
+        time::Instant::now(),
+    )
+    .await;
+    assert!(in_flight(&worker.endpoint.lookup_form()));
+    for registered in app_context.worker_registry.get_all() {
+        assert_eq!(
+            registered.status(),
+            WorkerStatus::Draining,
+            "the pass marks what it queues for removal"
+        );
+    }
+
+    // Listed again before the removal has started.
+    let url = worker.endpoint.render();
+    let listed_again = desired_state_of(&[worker]);
+    reconcile(
+        &listed_again,
+        DiscoveryKind::File,
+        &app_context,
+        time::Instant::now(),
+    )
+    .await;
+    assert!(
+        in_flight(&url),
+        "the registration is queued beside the removal that has not started"
+    );
+}
+
+/// The mark at the pass is for an endpoint that is no longer published. An
+/// address that is still published, here with another instance behind it,
+/// stays in service until its removal runs.
+#[tokio::test]
+async fn a_removal_at_a_published_address_is_left_to_its_job() {
+    use crate::workflow::{JobQueue, JobQueueConfig};
+
+    let app_context = create_test_app_context();
+    // No runner: a queued job never starts.
+    let queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: 4,
+            max_concurrent_jobs: 0,
+        },
+        Arc::downgrade(&app_context),
+    );
+    app_context.worker_job_queue.set(Arc::clone(&queue)).ok();
+    let was = published("http://10.0.0.1:8080", "f-1");
+    register_with_labels(
+        &app_context,
+        "http://10.0.0.1:8080",
+        &[
+            (DISCOVERY_PROVIDER_LABEL, "file"),
+            (DISCOVERY_ID_LABEL, "f-1"),
+            (DISCOVERY_SPEC_HASH_LABEL, &was.fingerprint()),
+        ],
+    );
+    for registered in app_context.worker_registry.get_all() {
+        registered.set_status(WorkerStatus::Ready);
+    }
+
+    // Another instance is published at the address: the pass queues the
+    // removal of the old registration.
+    let now = published("http://10.0.0.1:8080", "f-2");
+    let lookup = now.endpoint.lookup_form();
+    reconcile(
+        &desired_state_of(&[now]),
+        DiscoveryKind::File,
+        &app_context,
+        time::Instant::now(),
+    )
+    .await;
+    assert!(queue
+        .get_status(&lookup)
+        .is_some_and(|status| status.status == "pending"));
+    for registered in app_context.worker_registry.get_all() {
+        assert_eq!(registered.status(), WorkerStatus::Ready);
+    }
+}
+
+/// A removal that ends before its drain step leaves the registration the
+/// pass marked as draining, and nothing but a pass brings such a worker
+/// back. The next pass acts on it: its endpoint is still not published and
+/// the queue no longer answers for it, so the removal is queued again and
+/// takes the worker out.
+#[tokio::test]
+async fn a_worker_marked_for_a_removal_that_failed_is_removed_at_the_next_pass() {
+    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+    use crate::{
+        worker::BasicWorkerBuilder,
+        workflow::{JobQueue, JobQueueConfig, WorkflowEngines},
+    };
+
+    /// Waits until the queue answers neither pending nor processing for `url`.
+    async fn ended(queue: &JobQueue, url: &str) {
+        while queue
+            .get_status(url)
+            .is_some_and(|status| matches!(status.status.as_str(), "pending" | "processing"))
+        {
+            time::sleep(time::Duration::from_millis(20)).await;
+        }
+    }
+
+    // A queue that runs its jobs, and no workflow engine yet: a removal
+    // fails before its first step.
+    let app_context = create_test_app_context();
+    let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+    app_context.worker_job_queue.set(Arc::clone(&queue)).ok();
+    let worker = published("http://10.0.0.1:8080", "f-1");
+    let labels: HashMap<String, String> = [
+        (DISCOVERY_PROVIDER_LABEL, "file".to_string()),
+        (DISCOVERY_ID_LABEL, "f-1".to_string()),
+        (DISCOVERY_SPEC_HASH_LABEL, worker.fingerprint()),
+    ]
+    .into_iter()
+    .map(|(label, value)| (label.to_string(), value))
+    .collect();
+    // No drain window, so the removal that runs does not wait.
+    let registration = Arc::new(
+        BasicWorkerBuilder::new("http://10.0.0.1:8080")
+            .model(ModelCard::new("m"))
+            .labels(labels)
+            .health_config(HealthCheckConfig {
+                drain_settle_secs: 0,
+                ..Default::default()
+            })
+            .build(),
+    );
+    app_context.worker_registry.register(registration).unwrap();
+    for registered in app_context.worker_registry.get_all() {
+        registered.set_status(WorkerStatus::Ready);
+    }
+
+    // The worker leaves the published list: the pass queues its removal and
+    // marks the registration, and the job fails before its drain step.
+    let nothing_published = DesiredState::default();
+    let key = worker.endpoint.lookup_form();
+    reconcile(
+        &nothing_published,
+        DiscoveryKind::File,
+        &app_context,
+        time::Instant::now(),
+    )
+    .await;
+    time::timeout(time::Duration::from_secs(10), ended(&queue, &key))
+        .await
+        .expect("the first removal ends");
+    assert_eq!(
+        queue.get_status(&key).map(|status| status.status),
+        Some("failed".to_string()),
+        "the first removal failed before its drain step"
+    );
+    let left = app_context.worker_registry.get_all();
+    assert_eq!(left.len(), 1, "the failed removal took nothing out");
+    assert_eq!(
+        left[0].status(),
+        WorkerStatus::Draining,
+        "the pass marked the worker, and the failed removal left the mark"
+    );
+
+    // The next pass, with the engines there: the removal is queued again
+    // and runs.
+    app_context
+        .workflow_engines
+        .set(WorkflowEngines::new(&app_context.router_config))
+        .ok();
+    reconcile(
+        &nothing_published,
+        DiscoveryKind::File,
+        &app_context,
+        time::Instant::now(),
+    )
+    .await;
+    time::timeout(time::Duration::from_secs(30), ended(&queue, &key))
+        .await
+        .expect("the second removal ends");
+    assert!(
+        app_context.worker_registry.get_all().is_empty(),
+        "the second removal takes the worker out"
+    );
+}
+
+/// An addition does not bring a draining ZMQ worker back: the registration
+/// workflow leaves a worker that waits for its backend's handshake in the
+/// state it had. So the pass does not mark such a worker when it queues its
+/// removal, and does not add it again while it drains: it leaves and returns
+/// as a worker did before a pass read the draining state.
+#[tokio::test]
+async fn a_worker_that_waits_for_its_handshake_is_neither_marked_nor_added_again() {
+    use openai_protocol::model_card::ModelCard;
+
+    use crate::{
+        worker::BasicWorkerBuilder,
+        workflow::{JobQueue, JobQueueConfig},
+    };
+
+    let app_context = create_test_app_context();
+    // No runner: a queued job never starts.
+    let queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: 4,
+            max_concurrent_jobs: 0,
+        },
+        Arc::downgrade(&app_context),
+    );
+    app_context.worker_job_queue.set(Arc::clone(&queue)).ok();
+    let worker = published("tcp://10.0.0.1:8080", "f-1");
+    let labels: HashMap<String, String> = [
+        (DISCOVERY_PROVIDER_LABEL, "file".to_string()),
+        (DISCOVERY_ID_LABEL, "f-1".to_string()),
+        (DISCOVERY_SPEC_HASH_LABEL, worker.fingerprint()),
+    ]
+    .into_iter()
+    .map(|(label, value)| (label.to_string(), value))
+    .collect();
+    let registration = Arc::new(
+        BasicWorkerBuilder::new("tcp://10.0.0.1:8080")
+            .model(ModelCard::new("m"))
+            .labels(labels)
+            .connection_mode(ConnectionMode::Zmq)
+            .build(),
+    );
+    app_context.worker_registry.register(registration).unwrap();
+    for registered in app_context.worker_registry.get_all() {
+        registered.set_status(WorkerStatus::Ready);
+    }
+
+    // The worker leaves the published list: its removal is queued, and the
+    // worker serves until the job's drain step.
+    reconcile(
+        &DesiredState::default(),
+        DiscoveryKind::File,
+        &app_context,
+        time::Instant::now(),
+    )
+    .await;
+    assert!(queue
+        .get_status(&worker.endpoint.lookup_form())
+        .is_some_and(|status| status.status == "pending"));
+    for registered in app_context.worker_registry.get_all() {
+        assert_eq!(
+            registered.status(),
+            WorkerStatus::Ready,
+            "a worker an addition would not bring back is not marked"
+        );
+    }
+
+    // What the removal's drain step writes; the worker is listed again.
+    for registered in app_context.worker_registry.get_all() {
+        registered.set_status(WorkerStatus::Draining);
+    }
+    let url = worker.endpoint.render();
+    reconcile(
+        &desired_state_of(&[worker]),
+        DiscoveryKind::File,
+        &app_context,
+        time::Instant::now(),
+    )
+    .await;
+    assert!(
+        queue.get_status(&url).is_none(),
+        "no addition is queued for a draining worker it would not bring back"
+    );
+}
+
+/// A rank the pass marked can outlive its removal: the job ended before its
+/// drain step, and a rank beside it serves again. Nothing else brings the
+/// marked rank back, so the pass registers the worker again, as it does
+/// where every rank drains.
+#[tokio::test]
+async fn a_rank_left_draining_beside_one_that_serves_is_registered_again() {
+    use crate::workflow::{JobQueue, JobQueueConfig};
+
+    let app_context = create_test_app_context();
+    // No runner: a queued job stays in flight.
+    let queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: 4,
+            max_concurrent_jobs: 0,
+        },
+        Arc::downgrade(&app_context),
+    );
+    app_context.worker_job_queue.set(Arc::clone(&queue)).ok();
+    let worker = published("http://10.0.0.1:8080", "f-1");
+    for rank in ["http://10.0.0.1:8080@0", "http://10.0.0.1:8080@1"] {
+        register_with_labels(
+            &app_context,
+            rank,
+            &[
+                (DISCOVERY_PROVIDER_LABEL, "file"),
+                (DISCOVERY_ID_LABEL, "f-1"),
+                (DISCOVERY_SPEC_HASH_LABEL, &worker.fingerprint()),
+            ],
+        );
+    }
+    // Rank 0 as a pass marked it, with no job in flight for it; rank 1 serves.
+    for registered in app_context.worker_registry.get_all() {
+        registered.set_status(if registered.url().ends_with("@0") {
+            WorkerStatus::Draining
+        } else {
+            WorkerStatus::Ready
+        });
+    }
+
+    let url = worker.endpoint.render();
+    reconcile(
+        &desired_state_of(&[worker]),
+        DiscoveryKind::File,
+        &app_context,
+        time::Instant::now(),
+    )
+    .await;
+    assert!(
+        queue
+            .get_status(&url)
+            .is_some_and(|status| status.status == "pending"),
+        "the worker is registered again: nothing else brings the draining rank back"
     );
 }
 
