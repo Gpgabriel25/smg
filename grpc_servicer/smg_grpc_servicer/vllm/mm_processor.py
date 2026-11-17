@@ -119,7 +119,8 @@ class MmMediaFetchFault(MmProcessorUnavailable):
 
 # System errors of a connection attempt that name this worker, not the
 # reference's host: its descriptors, buffers, memory or local addresses ran
-# out, or its resolver cannot answer for now. Another worker may connect.
+# out, its interface or its route is down, or its resolver cannot answer for
+# now. Another worker may connect.
 _LOCAL_CONNECT_ERRNOS = frozenset(
     {
         errno.EMFILE,
@@ -127,6 +128,8 @@ _LOCAL_CONNECT_ERRNOS = frozenset(
         errno.ENOBUFS,
         errno.ENOMEM,
         errno.EADDRNOTAVAIL,
+        errno.ENETDOWN,
+        errno.ENETUNREACH,
         socket.EAI_AGAIN,
     }
 )

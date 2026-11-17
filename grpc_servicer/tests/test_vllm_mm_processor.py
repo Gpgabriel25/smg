@@ -880,14 +880,15 @@ class TestFetchErrorClassification:
 
     def test_a_failure_that_does_not_name_the_reference_stays_retryable_and_untyped(self):
         """The worker's own: its proxy (a connector and a response error too,
-        so tested first), its own limits and its resolver's "try again"
-        inside a connector error, and a loader it lacks. And what stays as it
+        so tested first), its own limits, its lost route and its resolver's
+        "try again" inside a connector error, and a loader it lacks. And what stays as it
         was: an origin 408 or 429, and a transfer that breaks in the body."""
         http = self._Http
         for exc in [
             http.ClientProxyConnectionError(ConnectionRefusedError(111, "Connect call failed")),
             http.ClientHttpProxyError(502),
             http.ClientConnectorError(OSError(errno.EMFILE, "Too many open files")),
+            http.ClientConnectorError(OSError(errno.ENETUNREACH, "Network is unreachable")),
             http.ClientConnectorDNSError(
                 socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
             ),
