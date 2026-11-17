@@ -512,6 +512,8 @@ mod tests {
     /// preparation's check passes. The media is inline and does not decode,
     /// and the model's configuration does not load, so a request that
     /// reached the pipeline would fail there, with another code and no fetch.
+    /// Two controls after the rows do: media an engine of the pool takes
+    /// passes the check and fails in the pipeline, under the pipeline's code.
     #[tokio::test]
     async fn media_the_gateway_resolves_to_process_is_refused_before_the_fetch() {
         fn refs_worker(url: &str) -> Arc<dyn Worker> {
@@ -535,6 +537,15 @@ mod tests {
                 media_type: "audio/wav".to_string(),
                 data: Arc::new("AAAA".to_string()),
                 uuid: None,
+            }])
+        }
+        fn image() -> MediaPlan {
+            MediaPlan::new([MediaContentPart::ImageBase64 {
+                media_type: "image/png".to_string(),
+                data: Arc::new("AAAA".to_string()),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
             }])
         }
         fn hinted_video() -> MediaPlan {
@@ -645,6 +656,51 @@ mod tests {
             let (code, message) = refusal(response).await;
             assert_eq!(code, "multimodal_not_supported", "{name}");
             assert_eq!(message, sentence, "{name}");
+        }
+
+        // The controls: the check refuses only what no engine of the pool
+        // takes. Each request resolves to the gateway as the first row's
+        // does, passes the check, reaches the pipeline and fails there on
+        // the model's configuration.
+        for (name, workers, plan, placeholders) in [
+            (
+                "the first row's pool and an image, which its engine takes",
+                vec![
+                    refs_worker("grpc://127.0.0.1:9817"),
+                    grpc_worker("grpc://127.0.0.1:9818", "m", RuntimeType::Vllm, &[]),
+                ],
+                image(),
+                expandable(Modality::Image),
+            ),
+            (
+                "the first row's request over a pool where one engine takes audio",
+                vec![
+                    refs_worker("grpc://127.0.0.1:9819"),
+                    grpc_worker("grpc://127.0.0.1:9820", "m", RuntimeType::TokenSpeed, &[]),
+                ],
+                audio(),
+                expandable(Modality::Audio),
+            ),
+        ] {
+            let (mut ctx, tokenizer) = context_over(registry_with(workers)).await;
+            let mut media = media_for(plan, MmProcessingMode::Auto, placeholders);
+            media.tokenizer_source = model_dir.path().to_str().unwrap().to_string();
+
+            let Err(response) = prepare_rendered_prompt(
+                &mut ctx,
+                &tokenizer,
+                "Hello token",
+                PromptEncoding::FromText,
+                Some(media),
+                &[],
+                "test",
+            )
+            .await
+            else {
+                panic!("{name}: the pipeline fails on the model's configuration");
+            };
+            let (code, _) = refusal(response).await;
+            assert_eq!(code, "multimodal_processing_failed", "{name}");
         }
     }
 }
