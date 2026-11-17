@@ -1502,6 +1502,87 @@ fn accepts(grammar: &Grammar, text: &str) -> bool {
     ends(grammar, text, 0).contains(&text.len())
 }
 
+/// The registry's tagged table, by the acceptor above: the tag of a required call takes one call
+/// and two calls and no text after a call, wherever the prompt and the engine leave the model,
+/// after what the thought owes there; a tag of one call takes one and no second.
+#[test]
+fn a_required_tag_takes_its_calls_and_no_text_after_them() {
+    const CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+    const BLOCK: &str = "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>";
+    let tools = [Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            })),
+            strict: None,
+            extra: Default::default(),
+        },
+    }];
+    let format = symphony::formats::Table::Qwen3Tagged.format();
+    for start in [
+        GrammarStart::Unknown,
+        GrammarStart::Either,
+        GrammarStart::AfterReasoning,
+        GrammarStart::FirstToken,
+    ] {
+        for (reasoning_open, thought_closed) in [(false, false), (true, false), (false, true)] {
+            // What the thought owes before the calls: its text and close where the engine starts
+            // the grammar inside it, the template's two newlines after a close the prompt did not
+            // write, nothing where the prompt wrote them itself.
+            let before = match (reasoning_open, thought_closed, start) {
+                (true, _, GrammarStart::FirstToken) => "\nNo tool fits.\n</think>\n\n",
+                (true, ..) | (false, false, GrammarStart::AfterReasoning) => "\n\n",
+                _ => "",
+            };
+            let tag = |one_call| {
+                format
+                    .grammar_for(
+                        &tools,
+                        Options {
+                            at_least_one: true,
+                            reasoning_open,
+                            thought_closed,
+                            one_call,
+                            start,
+                        },
+                    )
+                    .expect("a tag")
+            };
+            let (required, one) = (tag(false), tag(true));
+            let what = format!("{start:?}, thought open {reasoning_open}, closed {thought_closed}");
+            assert!(
+                accepts(&required, &format!("{before}{CALL}")),
+                "{what}: one call"
+            );
+            assert!(
+                accepts(&required, &format!("{before}{CALL}{CALL}")),
+                "{what}: two calls"
+            );
+            assert!(
+                !accepts(&required, &format!("{before}{CALL}\nDone.")),
+                "{what}: words after a call"
+            );
+            assert!(
+                !accepts(&required, &format!("{before}{CALL}\n{BLOCK}")),
+                "{what}: call-shaped text after a call"
+            );
+            assert!(
+                accepts(&one, &format!("{before}{CALL}")),
+                "{what}: the one call"
+            );
+            assert!(
+                !accepts(&one, &format!("{before}{CALL}{CALL}")),
+                "{what}: a second call"
+            );
+        }
+    }
+}
+
 #[test]
 fn every_layout_here_fits_its_table() {
     let Some((word, space)) = classes() else {
@@ -1581,9 +1662,9 @@ fn muse_glimmers_tags_take_what_its_chat_template_writes() {
         "no call owed: the answer is free text"
     );
     assert!(accepts(&answer, MUSE_ANSWER));
-    // A forced call starts with the lead the template writes for the tool, and the invoke's
-    // marker triggers each call.
-    let payload = required.payload();
+    // One forced call starts with the lead the template writes for the tool, and the invoke's
+    // marker triggers the call.
+    let payload = named.payload();
     assert_eq!(
         payload["format"]["elements"][0],
         json!({"type": "or", "elements": [
@@ -1591,15 +1672,28 @@ fn muse_glimmers_tags_take_what_its_chat_template_writes() {
             {"type": "const_string", "value": " to=fn_beta<|message|><atem:function_calls>\n"},
         ]})
     );
-    let calls = &payload["format"]["elements"][1];
-    assert_eq!(calls["triggers"], json!(["<atem:invoke"]));
+    let call = &payload["format"]["elements"][1];
+    assert_eq!(call["triggers"], json!(["<atem:invoke"]));
+    assert_eq!(call["tags"][1]["begin"], "<atem:invoke name=\"fn_beta\">\n");
+    // A forced call that allows more: each call is a message of its own, after its lead, with
+    // what the template writes between two messages and after the last.
+    let payload = required.payload();
+    let calls = &payload["format"]["elements"][0];
+    assert_eq!(
+        calls["separator"],
+        "\n</atem:function_calls><|eom|><|start|>assistant"
+    );
     assert_eq!(
         calls["tags"][1]["begin"],
-        "<atem:invoke name=\"fn_beta\">\n"
+        " to=fn_beta<|message|><atem:function_calls>\n<atem:invoke name=\"fn_beta\">\n"
     );
     assert_eq!(
         calls["tags"][1]["end"], "</atem:invoke>",
         "the newline after the last parameter is its own"
+    );
+    assert_eq!(
+        payload["format"]["elements"][1],
+        json!({"type": "const_string", "value": "\n</atem:function_calls>"})
     );
     // Near misses: an unknown tool, a missing required key, a call without its lead or without
     // its close.

@@ -11,9 +11,9 @@
 //! alike, as the newline a template writes after each) is the parameter's own, so a call that
 //! writes no parameter has the header, the text before the first and the rest of the text after the
 //! last. The terminal triggers the tag, so free text cannot write a call the tag does not
-//! constrain. Where the request asks for a call at once, the layout's lead comes first: the text
-//! the template writes before the terminal, such as a message's header the response template reads
-//! as text outside every field, written for each tool where it names one.
+//! constrain. Where the request asks for a call at once, the layout's lead comes before a call:
+//! the text the template writes before the terminal, such as a message's header the response
+//! template reads as text outside every field, written for each tool where it names one.
 //!
 //! A value follows its property's type. A string is any text that holds none of the texts a
 //! value's ends begin with, nor a terminal that takes the call out of its region, so the value ends
@@ -27,14 +27,18 @@
 //! such a key the schema does not require is left out.
 //!
 //! A tag of one call ends with what the layout writes after the last call, and nothing may follow
-//! it. Where the stream's stop closes the last call (Harmony's `<|call|>`), a call's region stays
-//! open after its parameters until the terminal that starts the next call, or the stop, so text
-//! after a tag of the calls would be the call's own: the calls a request may make at once are
-//! written one after another, the layout's text between two, and nothing follows the last but the
-//! stop. A tag the stop ends holds no repetition, which an engine cannot end on its own: a schema
-//! without properties takes at most one parameter there. Where no call is owed and more than one
-//! may come, such a call has no tag: the free text after a tag would be the call's own, and a
-//! parameter written there would count with nothing to constrain it.
+//! it. Where the request asks for a call at once and allows more, the calls are written one after
+//! another, each after its lead, with the layout's text between two and after the last, and no text
+//! is free: after a call the request owes, free text would let the model write on, and the table
+//! reads such text as content beside the call. Where the stream's stop closes the last call
+//! (Harmony's `<|call|>`), a call's region stays open after its parameters until the terminal that
+//! starts the next call, or the stop, so text after a tag of the calls would be the call's own:
+//! there too the calls a request may make at once are written one after another, the layout's text
+//! between two, and nothing follows the last but the stop. A tag the stop ends holds no repetition,
+//! which an engine cannot end on its own: a schema without properties takes at most one parameter
+//! there. Where no call is owed and more than one may come, such a call has no tag: the free text
+//! after a tag would be the call's own, and a parameter written there would count with nothing to
+//! constrain it.
 //!
 //! With the prompt's thought open, a tag that owes a call follows the free prefix every syntax's
 //! tag takes; one that owes none takes no prefix, its own free text writing the thought: an engine
@@ -115,9 +119,12 @@ pub(super) fn calls(
     if call.close.is_none() && !one && !count.at_least_one {
         return None;
     }
-    // Where the stop closes the last call, the calls are written one after another, nothing after
-    // the last; otherwise each call is a tag of its own, free text after it outside its region.
-    let in_a_row = call.close.is_none() && !one;
+    // Where the stop closes the last call, or the request asks for at least one call and allows
+    // more, the calls are written one after another, each after its lead, nothing after the last:
+    // free text after a required call would let the model write on, and the table reads that
+    // text as content beside the call. Otherwise each call is a tag of its own, free text after
+    // it outside its region.
+    let in_a_row = (call.close.is_none() || count.at_least_one) && !one;
     let end = match (in_a_row, one) {
         (false, true) => format!("{tail}{}", layout.after_calls),
         _ => tail.clone(),
@@ -729,19 +736,38 @@ mod tests {
             "content": lookup_parameters(json_words()),
             "end": "</c>",
         });
-        // A call at once: the lead for the tool first, then the calls.
+        // A call at once that allows more: the calls one after another, each after the lead for
+        // its tool, with what the layout writes between them, then what it writes after them.
+        let led = value!({
+            "type": "tag",
+            "begin": "@lookup\n<c n=\"lookup\">\n",
+            "content": lookup_parameters(json_words()),
+            "end": "</c>",
+        });
         assert_eq!(
             payload(&format, &[lookup()], options(true, false)),
             Some(value!({"format": {"type": "sequence", "elements": [
-                {"type": "const_string", "value": "@lookup\n"},
                 {
-                    "type": "triggered_tags",
-                    "triggers": ["<c"],
-                    "tags": [tag],
+                    "type": "tags_with_separator",
+                    "tags": [led],
+                    "separator": "\n\n",
                     "at_least_one": true,
                 },
+                {"type": "const_string", "value": "\n"},
             ]}}))
         );
+        // One call at once: the lead for the tool first, then the call, which ends with what the
+        // layout writes after the calls.
+        let one = payload(&format, &[lookup()], options(true, true)).expect("a tag");
+        assert_eq!(
+            one["format"]["elements"][0],
+            value!({"type": "const_string", "value": "@lookup\n"})
+        );
+        let call = &one["format"]["elements"][1];
+        assert_eq!(call["type"], "triggered_tags");
+        assert_eq!(call["stop_after_first"], true);
+        assert_eq!(call["tags"][0]["begin"], "<c n=\"lookup\">\n");
+        assert_eq!(call["tags"][0]["end"], "</c>\n");
         // No call owed: the lead is free text before the terminal.
         assert_eq!(
             payload(&format, &[lookup()], options(false, false)),
@@ -787,15 +813,20 @@ mod tests {
                 }),
             ),
         ];
-        let got = payload(&format, &tools, options(true, false)).expect("a tag");
+        // One call: the lead for whichever tool is called.
+        let one = payload(&format, &tools, options(true, true)).expect("a tag");
         assert_eq!(
-            got["format"]["elements"][0],
+            one["format"]["elements"][0],
             value!({"type": "or", "elements": [
                 {"type": "const_string", "value": "@lookup\n"},
                 {"type": "const_string", "value": "@other\n"},
             ]})
         );
-        let tags = &got["format"]["elements"][1]["tags"];
+        // More than one: each call after its own lead.
+        let got = payload(&format, &tools, options(true, false)).expect("a tag");
+        let tags = &got["format"]["elements"][0]["tags"];
+        assert_eq!(tags[0]["begin"], "@lookup\n<c n=\"lookup\">\n");
+        assert_eq!(tags[1]["begin"], "@other\n<c n=\"other\">\n");
         assert_eq!(
             tags[0]["content"],
             lookup_parameters(value!({"type": "or", "elements": [
@@ -937,7 +968,7 @@ mod tests {
             options(true, false),
         )
         .expect("a tag");
-        assert_eq!(got["format"]["type"], "triggered_tags");
+        assert_eq!(got["format"]["type"], "tags_with_separator");
         let calls = &got["format"]["tags"][0]["content"]["content"]["elements"];
         assert_eq!(calls[0]["elements"][0]["value"], "@lookup\n<cf.lookup:");
         assert_eq!(calls[1]["elements"][0]["value"], "@ping\n<cf.ping:");
@@ -981,11 +1012,11 @@ mod tests {
         assert_eq!(payload(&format, &[keyed(true)], options(true, false)), None);
         let got = payload(&format, &[quoted, keyed(false)], options(true, false))
             .expect("the readable tool");
-        let tags = got["format"]["elements"][1]["tags"]
+        let tags = got["format"]["elements"][0]["tags"]
             .as_array()
             .expect("tags");
         assert_eq!(tags.len(), 1);
-        assert_eq!(tags[0]["begin"], "<c n=\"keyed\">\n");
+        assert_eq!(tags[0]["begin"], "@keyed\n<c n=\"keyed\">\n");
         assert!(!tags[0]["content"].to_string().contains("a>b"));
     }
 

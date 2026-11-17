@@ -194,8 +194,7 @@ mod tests {
         assert_eq!(
             payload,
             value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["<tool_call>"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [
                     {
                         "type": "tag",
@@ -423,7 +422,6 @@ mod tests {
             ])
         );
         let block = &payload["format"]["elements"][1];
-        assert_eq!(block["triggers"], value!(["<tool_calls:opensource>"]));
         assert_eq!(block["tags"][0]["begin"], "<tool_calls:opensource>");
         assert_eq!(block["at_least_one"], true);
     }
@@ -516,8 +514,7 @@ mod tests {
             .expect("a grammar")
             .payload();
         let format = &payload["format"];
-        assert_eq!(format["type"], "triggered_tags");
-        assert_eq!(format["triggers"], value!(["<tool_calls:opensource>"]));
+        assert_eq!(format["type"], "tags_with_separator");
         let tags = format["tags"].as_array().expect("one way in");
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0]["begin"], "<tool_calls:opensource>");

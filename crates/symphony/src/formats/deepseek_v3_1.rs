@@ -664,7 +664,10 @@ mod tests {
         )
         .expect("a tag");
         assert_eq!(auto["format"]["at_least_one"], false);
-        assert_eq!(auto["format"]["triggers"], got["format"]["triggers"]);
+        assert_eq!(
+            auto["format"]["triggers"],
+            value!(["<｜tool▁calls▁begin｜>", "</think>"])
+        );
         assert_eq!(
             auto["format"]["tags"][0]["content"],
             value!({"type": "plus", "content": {"type": "or", "elements": [written_call(&forecast())]}})

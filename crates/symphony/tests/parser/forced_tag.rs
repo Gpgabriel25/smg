@@ -16,10 +16,13 @@ use std::sync::Arc;
 use openai_protocol::common::{Function, Tool};
 use serde_json::json;
 use symphony::{
+    adapt,
     formats::Table,
     grammar::{GrammarStart, Options},
-    CallSyntax,
+    CallSyntax, Declared, Engine, EngineFinish,
 };
+
+use crate::common::replay;
 
 /// Where a table writes no tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,5 +232,77 @@ fn every_known_gap_names_a_table_that_reads_calls_once() {
             table.name()
         );
         assert!(!why.is_empty(), "{}: a gap says why", table.name());
+    }
+}
+
+/// The tag of a required call with parallel calls allowed opens no call in free text, on any
+/// table, wherever the prompt and the engine leave the model: its calls stand one after another,
+/// so the model cannot write on after a call. A tag of one call stops after it. Under `auto` the
+/// free text stays, since a call is the model's choice there.
+#[test]
+fn a_required_tag_opens_no_call_in_free_text() {
+    let tools = tools();
+    let mut checked = 0;
+    for table in Table::ALL {
+        let format = table.format();
+        if format.call_syntax().is_none() {
+            continue;
+        }
+        for (configuration, options, passed) in configurations() {
+            if !options.at_least_one {
+                continue;
+            }
+            let Some(tag) = format.grammar_for(&tools[passed], options) else {
+                continue;
+            };
+            let payload = tag.payload().to_string();
+            let triggered = payload.contains("\"type\":\"triggered_tags\"");
+            if options.one_call {
+                assert!(
+                    !triggered || payload.contains("\"stop_after_first\":true"),
+                    "{} ({configuration}): one call's tag goes on after the call: {payload}",
+                    table.name()
+                );
+            } else {
+                assert!(
+                    !triggered,
+                    "{} ({configuration}): a call opens in free text, so text may follow a \
+                     required call: {payload}",
+                    table.name()
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no table reads calls");
+}
+
+/// What the tagged table reads when text follows or precedes a call, as a worker that takes no
+/// grammar may write it: the call, and the text as content, call syntax included. The reader
+/// keeps every byte it is given, so it is the tag above that keeps a required turn to its calls.
+#[test]
+fn text_beside_a_call_is_read_as_content_beside_the_call() {
+    const CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+    const BLOCK: &str = "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>";
+    for (output, content) in [
+        (format!("{CALL}\n{BLOCK}"), format!("\n{BLOCK}")),
+        (format!("{BLOCK}\n{CALL}"), format!("{BLOCK}\n")),
+    ] {
+        let mut parser = Engine::new(Table::Qwen3Tagged.format(), Declared::of(&tools()[..1]));
+        let events = replay(&mut parser, &output, &[], &EngineFinish::Stop, false).expect("a read");
+        let choice = adapt::chat::message(0, &events);
+        assert_eq!(
+            choice.message.content.as_deref(),
+            Some(content.as_str()),
+            "{output:?}"
+        );
+        let calls = choice.message.tool_calls.expect("the call");
+        assert_eq!(calls.len(), 1, "{output:?}");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some("{\"city\": \"Paris\"}")
+        );
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
     }
 }

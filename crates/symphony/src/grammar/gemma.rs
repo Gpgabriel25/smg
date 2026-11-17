@@ -432,8 +432,7 @@ mod tests {
         assert_eq!(
             payload,
             value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["<|tool_call>"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [
                     {
                         "type": "tag",
@@ -502,8 +501,7 @@ mod tests {
         assert_eq!(
             payload,
             value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["<start_function_call>"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [{
                     "type": "tag",
                     "begin": "<start_function_call>call:note{",
@@ -918,6 +916,9 @@ mod tests {
                 "excludes": ["<|tool_call>", "<tool_call|>", "<|\"|>"],
             })
         );
-        assert_eq!(payload["format"]["elements"][1]["type"], "triggered_tags");
+        assert_eq!(
+            payload["format"]["elements"][1]["type"],
+            "tags_with_separator"
+        );
     }
 }

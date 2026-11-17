@@ -559,8 +559,7 @@ mod tests {
         assert_eq!(
             payload,
             value!({"format": {"type": "sequence", "elements": [thought_first(), block_of(value!({
-                "type": "triggered_tags",
-                "triggers": ["<tool_call>"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [{
                     "type": "tag",
                     "begin": "<tool_call>\n",
@@ -714,8 +713,7 @@ mod tests {
         );
         assert_eq!(block, block_of(block["elements"][1].clone()));
         let triggered = &block["elements"][1];
-        assert_eq!(triggered["type"], "triggered_tags");
-        assert_eq!(triggered["triggers"], value!(["<tool_call>"]));
+        assert_eq!(triggered["type"], "tags_with_separator");
         assert_eq!(triggered["at_least_one"], true);
         let open = formats::minimax_m3()
             .grammar(&tools, true, true)
@@ -741,9 +739,14 @@ mod tests {
             either_block["tags"][0]["content"]["at_least_one"], true,
             "a block holds at least one invoke"
         );
-        let mut same = block;
-        same["elements"][1]["at_least_one"] = Value::Bool(false);
-        assert_eq!(either["format"]["elements"][1], same);
+        // Under `auto` the same tags open in free text; a required block's stand alone.
+        assert_eq!(either_block["type"], "triggered_tags");
+        assert_eq!(either_block["triggers"], value!(["<tool_call>"]));
+        assert_eq!(either_block["tags"], block["elements"][1]["tags"]);
+        assert_eq!(
+            either["format"]["elements"][1]["elements"][0],
+            block["elements"][0]
+        );
     }
 
     /// A schema of `k` properties per object over `d` levels, the leaves strings: k^d leaves.

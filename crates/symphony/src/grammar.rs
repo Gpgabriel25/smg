@@ -659,8 +659,21 @@ impl Count<'_> {
     }
 
     /// Tags `triggers` open in free text, as many as the count lets the model write; with one
-    /// call, each tag's end carries the end of the turn.
+    /// call, each tag's end carries the end of the turn. A count that asks for at least one call
+    /// and lets the model write more (`tool_choice` `required` with parallel calls) takes the
+    /// tags one after another and nothing else ([`Count::separated`]), then the end of the turn
+    /// where the table writes one: a required turn is its calls, and the free text a trigger
+    /// opens in would let the model write on after its call, text the table reads as content
+    /// beside the call.
     fn triggered(&self, triggers: Vec<String>, tags: Vec<Tag>) -> Grammar {
+        if self.at_least_one && !self.one {
+            let calls = self.separated(tags);
+            return if self.last.is_empty() {
+                calls
+            } else {
+                Grammar::Sequence(vec![calls, Grammar::ConstString(self.last.to_string())])
+            };
+        }
         let tags = tags
             .into_iter()
             .map(|tag| Tag {
@@ -1895,8 +1908,7 @@ mod tests {
         assert_eq!(
             grammar.payload(),
             value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["<tool_call>"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [
                     per_tool("get_weather", &schema),
                     per_tool("lookup", &schema),
@@ -1935,7 +1947,7 @@ mod tests {
                 ],
             })
         );
-        assert_eq!(elements[1]["type"], "triggered_tags");
+        assert_eq!(elements[1]["type"], "tags_with_separator");
     }
 
     #[test]
@@ -1945,10 +1957,6 @@ mod tests {
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
-        assert_eq!(
-            payload["format"]["triggers"],
-            value!(["<iquest_tool_call>"])
-        );
         assert_eq!(
             payload["format"]["tags"][0]["begin"],
             "<iquest_tool_call>get_weather"
@@ -2072,10 +2080,6 @@ mod tests {
             .grammar(&tools, true, true)
             .expect("a grammar")
             .payload();
-        assert_eq!(
-            as_xtml["format"]["triggers"],
-            value!(["<calls>", "</think>"])
-        );
         assert_eq!(begins(&as_xtml), ["<calls>", "</think>"]);
     }
 
@@ -2107,7 +2111,6 @@ mod tests {
             .grammar(&weather_tools(), true, true)
             .expect("a grammar")
             .payload();
-        assert_eq!(payload["format"]["triggers"], value!(["<calls>"]));
         assert_eq!(begins(&payload), ["<calls>"]);
         assert_eq!(payload["format"]["tags"][0]["end"], "</calls>");
     }
@@ -2125,7 +2128,6 @@ mod tests {
             .grammar(&tools, true, true)
             .expect("a grammar")
             .payload();
-        assert_eq!(as_xtml["format"]["triggers"], value!(["<tool_call>"]));
         assert_eq!(begins(&as_xtml), ["<tool_call>"]);
         assert_eq!(as_xtml["format"]["tags"][0]["end"], "</tool_call>");
     }
@@ -2170,10 +2172,6 @@ mod tests {
                 "<|calls|>",
                 "<|end|><|start|><|calls|>"
             ]
-        );
-        assert_eq!(
-            payload["format"]["triggers"],
-            value!(["<|start|>", "<|calls|>", "<|end|>"])
         );
         assert_eq!(payload["format"]["tags"][0]["end"], "<|/calls|>");
         // The open thought changes nothing: the tag closes it on its own way in.
@@ -2240,8 +2238,13 @@ mod tests {
 
     /// The `begin` of each way into a block, from a `triggered_tags` payload.
     fn begins(payload: &Value) -> Vec<String> {
-        payload["format"]["tags"]
-            .as_array()
+        let format = &payload["format"];
+        let tags = if format["tags"].is_array() {
+            &format["tags"]
+        } else {
+            &format["elements"][0]["tags"]
+        };
+        tags.as_array()
             .expect("tags")
             .iter()
             .map(|tag| tag["begin"].as_str().expect("a begin").to_string())
@@ -2287,10 +2290,6 @@ mod tests {
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
-        assert_eq!(
-            as_xtml["format"]["triggers"],
-            value!(["<calls>", "</think>"])
-        );
         assert_eq!(begins(&as_xtml), ["<calls>", "</think><calls>"]);
     }
 
@@ -2534,11 +2533,10 @@ mod tests {
             let payload = grammar.payload();
             assert_eq!(
                 payload["format"]["type"],
-                "triggered_tags",
+                "tags_with_separator",
                 "{}",
                 format.name()
             );
-            assert_eq!(payload["format"]["triggers"], value!(["<tool_call>"]));
             let tags = payload["format"]["tags"].as_array().expect("tags");
             assert_eq!(tags.len(), 3, "a nameless tool has no tag");
             assert_eq!(
@@ -2646,8 +2644,7 @@ mod tests {
         assert_eq!(
             payload,
             value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["<|content_invoke_tool_json|>"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [
                     per_tool("get_weather", &schema),
                     per_tool("lookup", &schema),
@@ -2766,8 +2763,7 @@ mod tests {
         assert_eq!(
             payload,
             value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["<TOOLCALL>"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [{
                     "type": "tag",
                     "begin": "<TOOLCALL>",
@@ -2817,8 +2813,7 @@ mod tests {
         assert_eq!(
             grammar.payload(),
             value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["[TOOL_CALLS]"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [{
                     "type": "tag",
                     "begin": "[TOOL_CALLS]",
@@ -2921,8 +2916,7 @@ mod tests {
         assert_eq!(
             payload,
             value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["[TOOL_CALLS]"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [
                     per_tool("get_weather", &schema),
                     per_tool("lookup", &schema),
@@ -2968,16 +2962,15 @@ mod tests {
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
-        let format = &payload["format"];
-        assert_eq!(format["type"], "triggered_tags");
+        // The ways in of a required call stand one after another and nothing else, then the
+        // close of the turn, which the table writes after the block.
+        assert_eq!(payload["format"]["type"], "sequence");
         assert_eq!(
-            format["triggers"],
-            value!([
-                "<|open|>tools<|sep|>",
-                "<|close|>think<|sep|>",
-                "<|close|>response<|sep|>"
-            ])
+            payload["format"]["elements"][1],
+            value!({"type": "const_string", "value": "<|close|>message<|sep|>"})
         );
+        let format = &payload["format"]["elements"][0];
+        assert_eq!(format["type"], "tags_with_separator");
         assert_eq!(format["at_least_one"], true);
         let tags = format["tags"].as_array().expect("three ways in");
         assert_eq!(
@@ -3086,20 +3079,22 @@ mod tests {
         let tools = weather_tools();
         for format in [formats::glm(), formats::gemma4(), formats::iquest()] {
             for at_least_one in [true, false] {
-                let many = format
-                    .grammar(&tools, at_least_one, false)
+                let mut many = format
+                    .grammar(&tools, false, false)
                     .expect("a grammar")
                     .payload();
+                many["format"]["at_least_one"] = Value::Bool(at_least_one);
                 assert_eq!(
                     one_call(&format, &tools, at_least_one, false),
                     stopping_at(many, "/format"),
                     "{}",
                     format.name()
                 );
-                let open = format
-                    .grammar(&tools, at_least_one, true)
+                let mut open = format
+                    .grammar(&tools, false, true)
                     .expect("a grammar")
                     .payload();
+                open["format"]["elements"][1]["at_least_one"] = Value::Bool(at_least_one);
                 assert_eq!(
                     one_call(&format, &tools, at_least_one, true),
                     stopping_at(open, "/format/elements/1"),
@@ -3142,10 +3137,11 @@ mod tests {
             "</minimax:tool_call>"
         );
         // dots3's block around each call: a tag per tool, stopping after the first.
-        let dots3 = formats::dots3()
-            .grammar(&tools, true, false)
+        let mut dots3 = formats::dots3()
+            .grammar(&tools, false, false)
             .expect("a grammar")
             .payload();
+        dots3["format"]["at_least_one"] = Value::Bool(true);
         assert_eq!(
             one_call(&formats::dots3(), &tools, true, false),
             stopping_at(dots3, "/format")
@@ -3159,7 +3155,7 @@ mod tests {
         // the end of the turn.
         let tools = weather_tools();
         let many = formats::kimi_k3()
-            .grammar(&tools, true, false)
+            .grammar(&tools, false, false)
             .expect("a grammar")
             .payload();
         let one = one_call(&formats::kimi_k3(), &tools, true, false);
@@ -4057,7 +4053,7 @@ mod tests {
                 .grammar(&tools, true, false)
                 .expect("a grammar")
                 .payload()["format"]["type"],
-            "triggered_tags"
+            "tags_with_separator"
         );
     }
 
@@ -4232,7 +4228,14 @@ mod tests {
                 .expect("a tag")
                 .payload();
             assert_eq!(tag["format"]["elements"][0], newline, "{tag}");
-            assert_eq!(tag["format"]["elements"][1]["type"], "triggered_tags");
+            assert_eq!(
+                tag["format"]["elements"][1]["type"],
+                if at_least_one {
+                    "tags_with_separator"
+                } else {
+                    "triggered_tags"
+                }
+            );
         }
         // The answer: the schema alone after the gate, the engine's own constraint.
         for start in [
@@ -4389,7 +4392,7 @@ mod tests {
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
-        assert_eq!(glm["format"]["type"], "triggered_tags");
+        assert_eq!(glm["format"]["type"], "tags_with_separator");
     }
 
     #[test]
@@ -4821,7 +4824,6 @@ mod tests {
             } else {
                 &payload["format"]
             };
-            assert_eq!(tags["triggers"], value!(["<|tool_call>"]));
             assert_eq!(tags["tags"][0]["begin"], "<|tool_call>call:get_weather{");
         }
         // The answer holds no marker, and is the same.
@@ -4871,12 +4873,17 @@ mod tests {
         nodes_of(&payload, "token", &mut tokens);
         assert!(tokens.iter().any(|token| token["token"] == "<|sep|>"));
         assert_eq!(
-            payload["format"]["triggers"],
-            value!([
+            payload["format"]["elements"][0]["tags"]
+                .as_array()
+                .expect("three ways in")
+                .iter()
+                .map(|tag| &tag["begin"])
+                .collect::<Vec<_>>(),
+            [
                 "<|open|>tools<|sep|>",
-                "<|close|>think<|sep|>",
-                "<|close|>response<|sep|>"
-            ])
+                "<|close|>think<|sep|><|open|>tools<|sep|>",
+                "<|close|>response<|sep|><|open|>tools<|sep|>",
+            ]
         );
     }
 

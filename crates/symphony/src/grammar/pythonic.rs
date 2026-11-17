@@ -328,8 +328,7 @@ mod tests {
         assert_eq!(
             payload,
             value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["<function_calls>"],
+                "type": "tags_with_separator", "separator": "",
                 "tags": [{
                     "type": "tag",
                     "begin": "<function_calls>",

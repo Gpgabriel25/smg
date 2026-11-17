@@ -167,7 +167,7 @@ mod tests {
             .grammar(tools, true, false)
             .expect("a grammar")
             .payload();
-        payload["format"]["tags"][0]["content"]["content"]["elements"][0].clone()
+        payload["format"]["elements"][0]["tags"][0]["content"]["content"]["elements"][0].clone()
     }
 
     #[test]

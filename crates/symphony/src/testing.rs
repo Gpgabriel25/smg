@@ -397,7 +397,15 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
         // With the thought closed, where the engine does not say: the calls at once.
         let calls = tag(false, GrammarStart::Unknown);
         let calls = &calls["format"];
-        assert_eq!(calls["type"], "triggered_tags", "{choice}: {calls}");
+        assert_eq!(
+            calls["type"],
+            if one_call {
+                "triggered_tags"
+            } else {
+                "tags_with_separator"
+            },
+            "{choice}: {calls}"
+        );
         assert_eq!(calls["at_least_one"], true, "{choice}: {calls}");
         assert_eq!(
             calls["stop_after_first"],
@@ -517,7 +525,7 @@ pub(crate) fn a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
             .payload();
         let calls = &tag["format"];
         assert_eq!(
-            calls["type"], "triggered_tags",
+            calls["type"], "tags_with_separator",
             "{name}: {start:?}: {calls}"
         );
         for tag in calls["tags"].as_array().expect("tags") {
