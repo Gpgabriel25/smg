@@ -949,10 +949,10 @@ async fn relay_upstream_stream(
                     }
 
                     // The upstream's end sentinel closes the upstream's
-                    // stream, not the client's. In a turn that handed calls
-                    // to the loop another turn follows, so the sentinel is
-                    // not passed through.
-                    if data == "[DONE]" && handler.handed_over_calls() {
+                    // stream, not the client's, so it is never passed
+                    // through: the loop ends the client's stream with one
+                    // sentinel of its own.
+                    if data == "[DONE]" {
                         continue;
                     }
 
@@ -2466,11 +2466,10 @@ mod tests {
         assert_eq!(sequence_number, 1);
     }
 
-    /// The whole interception path against a stub upstream that answers one
-    /// four-event stream: the client reads the stream's events, the loop's
-    /// terminal and the sentinel.
-    #[tokio::test]
-    async fn a_tool_interception_stream_ends_with_the_terminal_and_the_sentinel() {
+    /// The whole interception path against a stub upstream that answers
+    /// `upstream_events` as one event stream to every request: what the
+    /// client reads, to its stream's end.
+    async fn interception_stream_over(upstream_events: &[&str]) -> String {
         use std::sync::Arc;
 
         use axum::{
@@ -2492,7 +2491,7 @@ mod tests {
             .await
             .expect("a listener");
         let port = listener.local_addr().expect("an address").port();
-        let body = [CREATED, IN_PROGRESS, DELTA, COMPLETED].join("\n\n") + "\n\n";
+        let body = upstream_events.join("\n\n") + "\n\n";
         #[expect(
             clippy::disallowed_methods,
             reason = "test stub upstream answering one event stream per request; aborted at the test's end"
@@ -2547,7 +2546,16 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("the stream to its end");
-        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+        upstream.abort();
+        String::from_utf8(bytes.to_vec()).expect("utf-8")
+    }
+
+    /// The whole interception path against a stub upstream that answers one
+    /// four-event stream: the client reads the stream's events, the loop's
+    /// terminal and the sentinel.
+    #[tokio::test]
+    async fn a_tool_interception_stream_ends_with_the_terminal_and_the_sentinel() {
+        let text = interception_stream_over(&[CREATED, IN_PROGRESS, DELTA, COMPLETED]).await;
         assert!(text.contains("event: response.created\n"), "{text}");
         assert!(
             text.contains("event: response.output_text.delta\n"),
@@ -2555,7 +2563,33 @@ mod tests {
         );
         assert!(text.contains("event: response.completed\n"), "{text}");
         assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
-        upstream.abort();
+    }
+
+    /// The same path against an upstream that ends its stream with its own
+    /// end sentinel, as some upstreams do: the relay does not pass it on.
+    /// The client reads the loop's closing event and then one sentinel, the
+    /// stream's last block. A relay that passed the upstream's sentinel on
+    /// would hand a reader that stops at the first sentinel a stream with no
+    /// closing event.
+    #[tokio::test]
+    async fn the_upstreams_end_sentinel_of_an_answering_turn_is_not_relayed() {
+        let text =
+            interception_stream_over(&[CREATED, IN_PROGRESS, DELTA, COMPLETED, "data: [DONE]"])
+                .await;
+        let order: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("event: ") || line.starts_with("data: [DONE]"))
+            .collect();
+        assert_eq!(
+            text.matches("data: [DONE]").count(),
+            1,
+            "one end sentinel, the loop's own: {order:?}"
+        );
+        assert!(
+            order.ends_with(&["event: response.completed", "data: [DONE]"]),
+            "the closing event, then the sentinel: {order:?}"
+        );
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
     }
 
     /// The streaming MCP relay hands its request payload to the loop it

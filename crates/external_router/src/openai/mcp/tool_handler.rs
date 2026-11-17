@@ -529,12 +529,6 @@ impl StreamingToolHandler {
             .extend(self.pending_calls.iter().map(|call| call.output_index));
         std::mem::take(&mut self.pending_calls)
     }
-
-    /// Whether this turn handed calls to the tool loop. The client's stream
-    /// goes on after such a turn: the loop asks the upstream again.
-    pub fn handed_over_calls(&self) -> bool {
-        !self.dispatched_tool_call_indices.is_empty()
-    }
 }
 
 #[cfg(test)]
