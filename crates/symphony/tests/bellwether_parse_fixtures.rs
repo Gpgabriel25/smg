@@ -668,6 +668,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
     // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
     ("gemma-4-e4b-it", GenerationPrompt::ModelDecides),
+    ("gemma-4-26b-a4b-it", GenerationPrompt::ModelDecides),
+    ("gemma-4-12b-it", GenerationPrompt::ModelDecides),
     (
         "gemma-4-e2b-it-qat-q4-0-unquantized",
         GenerationPrompt::ModelDecides,

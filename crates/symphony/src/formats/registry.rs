@@ -628,6 +628,9 @@ mod tests {
             ("openbmb/MiniCPM-OCR-1.0-AWQ", Table::Qwen3Tagged),
             ("openbmb/MiniCPM-OCR-1.0-GPTQ", Table::Qwen3Tagged),
             ("XHToken/Spark-X2.6-1.7B", Table::Glm),
+            ("Jundot/gemma-4-12B-it-oQ8e-mtp", Table::Gemma4),
+            ("google/gemma-4-12B-it-qat-q4_0-unquantized", Table::Gemma4),
+            ("google/gemma-4-31B-it", Table::Gemma4),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");
