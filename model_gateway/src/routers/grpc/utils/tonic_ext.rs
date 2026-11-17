@@ -23,6 +23,16 @@ use crate::{
 /// [`TonicStatusExt::constraint_failure_response`]).
 pub(crate) const CONSTRAINT_FAILED_CODE: &str = "constraint_failed";
 
+/// The client's words for a media fetch that failed for the reference's own
+/// reason (see [`TonicStatusExt::media_message`]).
+const MEDIA_FETCH_FAILED_CLIENT: &str =
+    "The media could not be fetched from its URL: check that the URL is reachable and serves the media";
+
+/// The client's words for a media fetch whose host has trouble that may pass
+/// (see [`TonicStatusExt::media_message`]).
+const MEDIA_FETCH_FAILED_TRANSIENT: &str =
+    "The media could not be fetched from its URL for now: its host did not answer in time or failed; a retry may succeed";
+
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
     /// Map gRPC status code to the corresponding HTTP status code. A failure
@@ -79,6 +89,14 @@ pub(crate) trait TonicStatusExt {
     /// `media_fetch_failed` from a worker that names none or one this router
     /// does not know.
     fn media_code(&self) -> MediaErrorCode;
+
+    /// The client's words for a failure of the request's media (see
+    /// [`TonicStatusExt::media_fault`]). Media refused as the request sent
+    /// it and a size refusal keep the worker's own words: they describe the
+    /// request's payload. A fetch that failed gets the gateway's sentence
+    /// for whose fault it is; the worker's words for it stay on the
+    /// gateway's log line.
+    fn media_message(&self, fault: WorkerMediaFault) -> String;
 
     /// The HTTP status the circuit breaker samples for this failure; `None`
     /// for a failure of the request's media, which says nothing about the
@@ -249,6 +267,17 @@ impl TonicStatusExt for tonic::Status {
                     MediaErrorCode::FetchFailed
                 }
             })
+    }
+
+    fn media_message(&self, fault: WorkerMediaFault) -> String {
+        match self.media_code() {
+            MediaErrorCode::FetchFailed => match fault {
+                WorkerMediaFault::Client => MEDIA_FETCH_FAILED_CLIENT,
+                WorkerMediaFault::Transient => MEDIA_FETCH_FAILED_TRANSIENT,
+            }
+            .to_string(),
+            MediaErrorCode::InvalidRequest | MediaErrorCode::TooLarge => self.message().to_string(),
+        }
     }
 
     fn breaker_status(&self) -> Option<u16> {
@@ -529,6 +558,12 @@ mod tests {
         assert_eq!(client.http_status(), StatusCode::BAD_REQUEST);
         assert_eq!(client.media_code(), MediaErrorCode::FetchFailed);
         assert_eq!(client.breaker_status(), None);
+        // The client reads the gateway's sentence for a fetch that failed,
+        // by whose fault it is; the worker's own words stay on the log line.
+        assert_eq!(
+            client.media_message(WorkerMediaFault::Client),
+            MEDIA_FETCH_FAILED_CLIENT
+        );
 
         let transient = WorkerMediaFault::Transient.stamp(tonic::Status::unavailable(
             "media fetch of https://media.example/a.png timed out after 10s",
@@ -536,6 +571,10 @@ mod tests {
         assert_eq!(transient.media_fault(), Some(WorkerMediaFault::Transient));
         assert_eq!(transient.http_status(), StatusCode::BAD_GATEWAY);
         assert_eq!(transient.media_code(), MediaErrorCode::FetchFailed);
+        assert_eq!(
+            transient.media_message(WorkerMediaFault::Transient),
+            MEDIA_FETCH_FAILED_TRANSIENT
+        );
         let result: Result<(), tonic::Status> = Err(transient);
         assert_eq!(result.breaker_status(), None);
 
@@ -550,6 +589,12 @@ mod tests {
         assert_eq!(too_large.http_status(), StatusCode::BAD_REQUEST);
         assert_eq!(too_large.media_code(), MediaErrorCode::TooLarge);
         assert_eq!(too_large.breaker_status(), None);
+        // A size refusal and media refused as sent describe the request's
+        // payload: the worker's words reach the client.
+        assert_eq!(
+            too_large.media_message(WorkerMediaFault::Client),
+            too_large.message()
+        );
 
         let refused = smg_grpc_client::stamp_media_code(
             WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(
@@ -561,6 +606,10 @@ mod tests {
         assert_eq!(refused.http_status(), StatusCode::BAD_REQUEST);
         assert_eq!(refused.media_code(), MediaErrorCode::InvalidRequest);
         assert_eq!(refused.breaker_status(), None);
+        assert_eq!(
+            refused.media_message(WorkerMediaFault::Client),
+            "data URL parse error: missing comma in data url"
+        );
 
         // The gRPC framing's refusal of a message longer than its four-byte
         // length prefix carries (tonic's words; this gateway's own client
