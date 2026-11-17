@@ -373,8 +373,10 @@ impl ProviderProfile {
     /// segments of a self-hosted id) is passed without a comparison. A chat
     /// request is read through here several times: once to normalize it,
     /// once to validate it, once more for the stages. A name added under a
-    /// new first letter needs its arm here; the tests hold the plain
-    /// reading, every test on every segment, and compare the two.
+    /// new first letter needs its arm here: the lists of names kept outside
+    /// this function check their first letters when the crate is built, and
+    /// the tests hold the plain reading, every test on every segment, and
+    /// compare the two.
     fn from_model_segments(model: &str) -> Self {
         let mut openai = false;
         let mut gpt_oss = false;
@@ -635,11 +637,35 @@ fn is_openai_segment(segment: &str) -> bool {
         "text-embedding-",
         "omni-moderation",
     ];
+    // A segment reaches this test under one of four first letters in
+    // `ProviderProfile::from_model_segments`: a prefix under another letter
+    // does not build before it has its arm there. `openai` and the reasoning
+    // series start with an `o`.
+    const _: () = assert!(every_name_starts_with(&PREFIXES, b"gcto"));
     segment.eq_ignore_ascii_case("openai")
         || PREFIXES
             .iter()
             .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
         || is_openai_reasoning_series(segment)
+}
+
+/// Whether every name starts with one of `letters`, whatever its case: the
+/// compile-time check that ties a list of names kept outside
+/// [`ProviderProfile::from_model_segments`] to its arm there.
+const fn every_name_starts_with(names: &[&str], letters: &[u8]) -> bool {
+    let mut name = 0;
+    while name < names.len() {
+        let first = names[name].as_bytes()[0].to_ascii_lowercase();
+        let mut letter = 0;
+        while letter < letters.len() && letters[letter] != first {
+            letter += 1;
+        }
+        if letter == letters.len() {
+            return false;
+        }
+        name += 1;
+    }
+    true
 }
 
 /// `o1`, `o3`, `o4-mini`, `o3-pro-2025-06-10`: an `o`, the series digit, then

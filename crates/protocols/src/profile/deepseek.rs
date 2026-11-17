@@ -41,7 +41,15 @@ use crate::{
 const V41_MODELS: [&str; 2] = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"];
 
 pub(super) fn matches_model(segment: &str) -> bool {
-    ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"]
+    const NAMES: [&str; 3] = ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"];
+    // A segment reaches this test under the letter `d` only, in
+    // `ProviderProfile::from_model_segments`: a name under another letter
+    // does not build before it has its arm there.
+    const _: () = assert!(
+        super::every_name_starts_with(&NAMES, b"d")
+            && super::every_name_starts_with(&V41_MODELS, b"d")
+    );
+    NAMES
         .iter()
         .chain(&V41_MODELS)
         .any(|model| segment.eq_ignore_ascii_case(model))
