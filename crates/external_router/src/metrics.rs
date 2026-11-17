@@ -492,7 +492,18 @@ pub mod handles {
         build: impl FnOnce(Arc<str>) -> H,
         use_handle: impl FnOnce(&H),
     ) {
-        if let Some(handle) = map.get(model_id) {
+        // One model is the usual deployment, and comparing its name costs a
+        // fraction of hashing it with SipHash: the hash runs only once the
+        // map holds a second model.
+        let found = if map.len() == 1 {
+            map.iter()
+                .next()
+                .filter(|&(label, _)| **label == *model_id)
+                .map(|(_, handle)| handle)
+        } else {
+            map.get(model_id)
+        };
+        if let Some(handle) = found {
             use_handle(handle);
             return;
         }
@@ -599,6 +610,29 @@ pub mod handles {
             with_model_handle(&mut map, "kept-model", |_| 0, |handle| used = Some(*handle));
             assert_eq!(used, Some("kept-model".len()), "found by its text");
             assert_eq!(map.len(), 1);
+        }
+
+        #[test]
+        fn a_map_of_one_model_finds_that_model_and_no_other() {
+            let mut map: HashMap<Arc<str>, usize> = HashMap::new();
+            let builds = Cell::new(0);
+            let mut used = Vec::new();
+            // The two names have one length: only their last byte tells
+            // them apart.
+            for model in ["model-a", "model-a", "model-b", "model-a", "model-b"] {
+                with_model_handle(
+                    &mut map,
+                    model,
+                    |label| {
+                        builds.set(builds.get() + 1);
+                        label.len() * 10 + usize::from(label.ends_with('b'))
+                    },
+                    |handle| used.push(*handle),
+                );
+            }
+            assert_eq!(builds.get(), 2);
+            assert_eq!(map.len(), 2);
+            assert_eq!(used, [70, 70, 71, 70, 71]);
         }
 
         #[test]
