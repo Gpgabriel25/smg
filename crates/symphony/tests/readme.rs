@@ -1217,8 +1217,8 @@ const GROUPS: &[Group] = &[
         released: "2026-10-01",
         smg: (None, None),
         table: Some(Table::Qwen2_5),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(11),
+        status: Status::Replaying,
     },
     Group {
         slug: "granite-speech-3.2-8b",
