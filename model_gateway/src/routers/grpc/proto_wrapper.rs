@@ -1529,6 +1529,90 @@ mod tracked_tests {
         );
     }
 
+    /// A single dispatch earns its worker's breaker success once, at its
+    /// stream's first response: not when the call returned its stream, and
+    /// not again for the responses after the first.
+    #[tokio::test]
+    async fn a_single_dispatch_earns_one_breaker_success_at_its_first_response() {
+        type Item = Result<ProtoGenerateResponse, tonic::Status>;
+        let chunk = |cached_tokens| -> Item {
+            let chunk = vllm::GenerateStreamChunk {
+                cached_tokens,
+                ..Default::default()
+            };
+            let response = Some(vllm::generate_response::Response::Chunk(chunk));
+            Ok(ProtoGenerateResponse::Vllm(Box::new(
+                vllm::GenerateResponse { response },
+            )))
+        };
+        // A child that yields two chunks and ends (each replayed by a tracked
+        // layer of its own, on an engine of its own), read through a fan-out.
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let empty = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+        let child = [2, 1].into_iter().fold(empty, |inner, id| {
+            let mut layer = inner.tracked(Arc::clone(&engine), 0, false);
+            if let ProtoStream::Tracked(tracked) = &mut layer {
+                tracked.replay = Some(Some(chunk(id)));
+            }
+            layer
+        });
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w1:30000").build());
+        let successes = || {
+            worker
+                .as_any()
+                .downcast_ref::<crate::worker::BasicWorker>()
+                .expect("a basic worker")
+                .circuit_breaker
+                .load()
+                .total_successes()
+        };
+        let booking = DispatchBooking::book(&worker, 16, true);
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(vec![child]))
+            .tracked_single_booked(Arc::clone(&worker), booking);
+        assert_eq!(
+            successes(),
+            0,
+            "the call returned its stream: no answer yet"
+        );
+        assert!(stream.next().await.is_some_and(|item| item.is_ok()));
+        assert_eq!(successes(), 1, "earned at the first response");
+        assert!(stream.next().await.is_some_and(|item| item.is_ok()));
+        assert!(stream.next().await.is_none(), "to the stream's end");
+        assert_eq!(successes(), 1, "one success a dispatch, not one a response");
+    }
+
+    /// A single dispatch whose stream ends with nothing on it earns no
+    /// breaker success: a failure before it stands, so the next one opens a
+    /// breaker set to two.
+    #[tokio::test]
+    async fn a_single_dispatch_that_ends_with_nothing_on_it_earns_no_breaker_success() {
+        use crate::worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://w1:30000")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.record_outcome(504);
+        let booking = DispatchBooking::book(&worker, 16, true);
+        let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_single_booked(Arc::clone(&worker), booking);
+        assert!(
+            stream.next().await.is_none(),
+            "an empty fanout ends at once"
+        );
+        drop(stream);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        worker.record_outcome(504);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "two failures with no success earned between them"
+        );
+    }
+
     #[test]
     fn a_prefill_side_booked_at_dispatch_is_pending_before_its_stream_exists() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
