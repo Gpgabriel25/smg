@@ -107,10 +107,21 @@ use crate::{
 /// [`PDRouter::handle_server_selection_error`].
 type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
 
-/// Response extension: the side whose worker answered the attempt's 500
-/// itself (see [`PDRouter::settle_attempt`]).
+/// Response extension: the side that failed the attempt by itself. Its
+/// worker answered an error status before the side's first byte, or the
+/// call to it failed below HTTP. The attempt is recorded on that side's
+/// worker alone ([`PDRouter::record_attempt_outcomes`]), and a worker's own
+/// 500 is settled on the request's ledger ([`PDRouter::settle_attempt`]).
 #[derive(Clone, Copy, Debug)]
 struct OwnFailure(PdSide);
+
+/// The side that failed the attempt by itself, when the answer names one.
+fn own_failure(response: &Response) -> Option<PdSide> {
+    response
+        .extensions()
+        .get::<OwnFailure>()
+        .map(|&OwnFailure(side)| side)
+}
 
 /// The load one admitted PD request holds. The Prefill guard is released
 /// when the Prefill phase ends; the Decode guard rides on the response body.
@@ -1206,11 +1217,16 @@ impl PDRouter {
             response.status(),
             prefill_outcome,
             head_success_recorded(&response),
+            own_failure(&response),
         );
         self.settle_attempt(ledger, model_id, [&prefill, &decode], response)
     }
 
-    /// Record an attempt's outcome on both sides. On the early-commit path the
+    /// Record an attempt's outcome on both sides, or on one. A status one
+    /// side failed with by itself (`failed_side`, see [`OwnFailure`]) is
+    /// that worker's alone, as the sequential path records it: charged to
+    /// its partner too, one failing decode worker would open the breaker of
+    /// the healthy prefill worker beside it. On the early-commit path the
     /// drain records the prefill's once its body is known: the attempt's
     /// status is the decode's there, and recording it on the prefill would
     /// reset the failures the drain counts. A streamed decode head's success
@@ -1222,12 +1238,15 @@ impl PDRouter {
         status: StatusCode,
         prefill_outcome: PrefillOutcome,
         decode_head_recorded: bool,
+        failed_side: Option<PdSide>,
     ) {
-        let attempt_records_prefill = prefill_outcome == PrefillOutcome::FromStatus;
+        let attempt_records_prefill =
+            prefill_outcome == PrefillOutcome::FromStatus && failed_side != Some(PdSide::Decode);
+        let attempt_records_decode = failed_side != Some(PdSide::Prefill);
         if attempt_records_prefill {
             prefill.record_outcome(status.as_u16());
         }
-        if !(decode_head_recorded && status.is_success()) {
+        if attempt_records_decode && !(decode_head_recorded && status.is_success()) {
             decode.record_outcome(status.as_u16());
         }
 
@@ -1241,11 +1260,13 @@ impl PDRouter {
                     error_type,
                 );
             }
-            Metrics::record_worker_error(
-                metrics_labels::WORKER_DECODE,
-                metrics_labels::CONNECTION_HTTP,
-                error_type,
-            );
+            if attempt_records_decode {
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::CONNECTION_HTTP,
+                    error_type,
+                );
+            }
         }
     }
 
@@ -1259,10 +1280,10 @@ impl PDRouter {
     /// status's body as the envelope, not as events. An error body that
     /// cannot be read says so in the detail.
     ///
-    /// The answer is marked as the worker's own. Its 500 is definitive for
-    /// the payload and names the side for the request's ledger
-    /// ([`Self::settle_attempt`]). Its other statuses name no side and are
-    /// replayed as before.
+    /// The answer is marked as the worker's own and as the side's own
+    /// failure ([`OwnFailure`]). Its 500 is definitive for the payload and
+    /// is settled on the request's ledger ([`Self::settle_attempt`]). Its
+    /// other statuses are replayed as before.
     async fn side_refused(side: PdSide, response: reqwest::Response) -> Response {
         let status = response.status();
         // Taken before the body read consumes the response.
@@ -1279,9 +1300,7 @@ impl PDRouter {
             answer.headers_mut().insert(RETRY_AFTER, value);
         }
         mark_upstream_answer(&mut answer);
-        if is_definitive_failure(&answer) {
-            answer.extensions_mut().insert(OwnFailure(side));
-        }
+        answer.extensions_mut().insert(OwnFailure(side));
         answer
     }
 
@@ -1314,7 +1333,8 @@ impl PDRouter {
         pair: [&Arc<dyn Worker>; 2],
         mut response: Response,
     ) -> Response {
-        let Some(&OwnFailure(side)) = response.extensions().get::<OwnFailure>() else {
+        // Of a side's own failures only its worker's own 500 is definitive.
+        let Some(side) = own_failure(&response).filter(|_| is_definitive_failure(&response)) else {
             return response;
         };
         let [prefill, decode] = pair;
@@ -1609,8 +1629,8 @@ impl PDRouter {
                     PdSide::Decode => &decode,
                 };
                 // The request's own timeout on either side is the request's
-                // end (see `retry::request_timeout_response`); the caller
-                // records the 504 on both workers as it records every status.
+                // end (see `retry::request_timeout_response`). It names no
+                // side, so the caller records the 504 on both workers.
                 if is_request_timeout(&e) {
                     error!(
                         worker = Endpoint::redacted_str(worker.url()),
@@ -1627,9 +1647,11 @@ impl PDRouter {
                     side.name(),
                     cause(&e)
                 );
-                // Don't record_outcome here — the caller (execute_dual_dispatch)
-                // records outcomes from the response status after we return.
-                return side.answer(SidePhase::Start, StatusCode::BAD_GATEWAY, cause(&e));
+                // Not recorded here: the caller records the response status
+                // after we return, on this side's worker alone.
+                let mut answer = side.answer(SidePhase::Start, StatusCode::BAD_GATEWAY, cause(&e));
+                answer.extensions_mut().insert(OwnFailure(side));
+                return answer;
             }
             Err(DispatchError::Prefill(response)) => return response,
             Err(DispatchError::Decode(response)) => {
@@ -5228,6 +5250,7 @@ mod tests {
                     StatusCode::OK,
                     outcome,
                     false,
+                    None,
                 );
             }
             assert_eq!(!prefill.circuit_breaker_can_execute(), trips, "{outcome:?}");
@@ -7607,6 +7630,7 @@ mod tests {
             StatusCode::OK,
             PrefillOutcome::FromStatus,
             true,
+            None,
         );
         assert_eq!(recorded.circuit_breaker_state(), CircuitState::HalfOpen);
 
@@ -7617,6 +7641,7 @@ mod tests {
             StatusCode::OK,
             PrefillOutcome::FromStatus,
             false,
+            None,
         );
         assert_eq!(unrecorded.circuit_breaker_state(), CircuitState::Closed);
     }
@@ -8893,6 +8918,72 @@ mod tests {
             (response.status(), refused.lock().unwrap().len()),
             (StatusCode::INTERNAL_SERVER_ERROR, 1),
             "the answer, the attempts on the refusing decode worker"
+        );
+    }
+
+    /// On the parallel dispatch a status one side fails with by itself is
+    /// recorded on that side's worker alone, as the sequential path and the
+    /// gRPC prefill-decode route record it: its own error status, or a call
+    /// to it that failed below HTTP. Every worker's breaker opens on its
+    /// first failure here, so a charge to either side shows: the failing
+    /// side's is open after one request and its partner's is closed.
+    /// Charged with its partner's failure, a healthy worker leaves the
+    /// rotation with the failing one.
+    #[tokio::test]
+    async fn a_sides_own_failure_is_charged_to_its_worker_alone() {
+        use Fault::{Refuses, Unreachable};
+        use PdSide::{Decode, Prefill};
+
+        let rows = [
+            (Decode, Refuses(StatusCode::INTERNAL_SERVER_ERROR)),
+            (Decode, Unreachable),
+            (Prefill, Refuses(StatusCode::INTERNAL_SERVER_ERROR)),
+            (Prefill, Unreachable),
+        ];
+        let mut mismatches = Vec::new();
+        for (side, fault) in rows {
+            let (failing_url, _refusing) = faulty_stub(fault).await;
+            let healthy_url = healthy_stub(Shape::Parallel, side.partner()).await;
+            let failing = fragile_worker(
+                failing_url,
+                match side {
+                    Prefill => WorkerType::Prefill,
+                    Decode => WorkerType::Decode,
+                },
+            );
+            let partner = fragile_worker(
+                healthy_url,
+                match side {
+                    Prefill => WorkerType::Decode,
+                    Decode => WorkerType::Prefill,
+                },
+            );
+            let router = single_attempt_router();
+            for worker in [&failing, &partner] {
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::clone(worker));
+            }
+
+            let response = chat_through(&router, false).await;
+
+            let charged = (
+                !failing.circuit_breaker_can_execute(),
+                !partner.circuit_breaker_can_execute(),
+            );
+            if response.status().is_success() || charged != (true, false) {
+                mismatches.push(format!(
+                    "{side:?} {fault:?}: {}, the failing side's breaker open: {}, its partner's breaker open: {}",
+                    response.status(),
+                    charged.0,
+                    charged.1
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "a side's own failure is not its worker's alone:\n{}",
+            mismatches.join("\n")
         );
     }
 
