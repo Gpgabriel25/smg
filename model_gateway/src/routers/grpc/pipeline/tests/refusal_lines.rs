@@ -498,6 +498,55 @@ async fn a_content_part_the_harmony_build_refuses_is_one_warn_and_marked() {
     );
 }
 
+/// An input item the Harmony path has no form for (a custom tool call) is the request's to fix
+/// on the Responses door too: the Harmony preparation writes one WARN with the cause and marks
+/// the answer. The conversion that refuses the item names its kind at DEBUG, so the refusal is
+/// one line at the levels an operator reads by default. This build loads its encoding before it
+/// converts the input, so the test reads the vocabulary, as the builder's own tests do.
+#[tokio::test]
+async fn an_input_item_the_harmony_build_refuses_is_one_warn_and_marked() {
+    let ctx = responses_context_over(
+        Endpoint::Harmony,
+        Mode::Regular,
+        &Arc::new(WorkerRegistry::new()),
+        0,
+    )
+    .await;
+    let request: Arc<ResponsesRequest> = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "input": [
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "run", "input": "ls"}
+            ],
+        }))
+        .expect("responses request"),
+    );
+    let lines = LinesAtWarnOrAbove::default();
+    let _subscriber = test_subscriber(lines.clone());
+
+    let Err(response) = ctx
+        .pipeline
+        .execute_harmony_responses(&request, &ctx, None)
+        .await
+    else {
+        panic!("the build refuses the item");
+    };
+
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error::extract_error_code_from_response(&response),
+        "harmony_build_failed"
+    );
+    assert!(marked(&response));
+    assert_eq!(
+        lines.lines(),
+        [(
+            Level::WARN,
+            "Harmony build failed for responses request".to_string()
+        )]
+    );
+}
+
 /// A failure in the server's class keeps its ERROR lines, the pipeline's among them: a served
 /// model with no tokenizer on a gateway that loads none itself.
 #[tokio::test]

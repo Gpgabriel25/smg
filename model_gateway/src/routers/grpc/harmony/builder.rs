@@ -25,7 +25,7 @@ use openai_protocol::{
     },
 };
 use serde_json::json;
-use tracing::{debug, enabled, trace, warn, Level};
+use tracing::{debug, enabled, trace, Level};
 
 use super::types::HarmonyBuildOutput;
 use crate::routers::grpc::{
@@ -42,21 +42,26 @@ static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 /// image or a file part is refused by name, as chat audio is
 /// ([`reject_chat_media`]), never dropped from the prompt behind an answer
 /// that reads as if the model had seen it.
-fn harmony_text_parts(parts: &[ResponseContentPart]) -> Result<Vec<String>, String> {
+fn harmony_text_parts(parts: &[ResponseContentPart]) -> Result<Vec<String>, PromptError> {
     parts
         .iter()
         .map(|part| match part {
             ResponseContentPart::OutputText { text, .. }
             | ResponseContentPart::InputText { text } => Ok(text.clone()),
             ResponseContentPart::Refusal { refusal } => Ok(refusal.clone()),
-            ResponseContentPart::InputImage { .. } => {
-                Err("Harmony does not support \"input_image\" content parts".to_string())
-            }
-            ResponseContentPart::InputFile { .. } => {
-                Err("Harmony does not support \"input_file\" content parts".to_string())
-            }
+            ResponseContentPart::InputImage { .. } => Err(PromptError::Refused(
+                "Harmony does not support \"input_image\" content parts".to_string(),
+            )),
+            ResponseContentPart::InputFile { .. } => Err(PromptError::Refused(
+                "Harmony does not support \"input_file\" content parts".to_string(),
+            )),
         })
         .collect()
+}
+
+/// The refusal of an input item kind the Harmony path has no form for.
+fn unsupported_item() -> PromptError {
+    PromptError::Refused("Unsupported input item type".to_string())
 }
 
 /// Refuses the content parts the Harmony path has no form for. It renders
@@ -511,10 +516,7 @@ impl HarmonyBuilder {
         request: &ResponsesRequest,
     ) -> Result<HarmonyBuildOutput, PromptError> {
         let encoding = try_harmony_encoding()?;
-        // The conversion fails only on what the request's own input holds.
-        let all_messages = self
-            .construct_input_messages_with_harmony(request)
-            .map_err(PromptError::Refused)?;
+        let all_messages = self.construct_input_messages_with_harmony(request)?;
         let output = self.encode_prompt(encoding, all_messages)?;
 
         // What the model receives, decoded back for the trace lines alone:
@@ -709,13 +711,14 @@ impl HarmonyBuilder {
     /// * `prev_response` - Optional previous response to continue from
     ///
     /// # Errors
-    /// Only what the input itself holds fails the conversion: an item kind or
-    /// a content part with no Harmony form, a function output with no call.
-    /// `build_from_responses` types every error here as the request's refusal.
+    /// [`PromptError::Refused`], typed where it happens, for what the input
+    /// itself holds: an item kind or a content part with no Harmony form, a
+    /// function output with no call. A bare message is a failure, as in
+    /// `build_from_chat`.
     fn construct_input_messages_with_harmony(
         &self,
         request: &ResponsesRequest,
-    ) -> Result<Vec<HarmonyMessage>, String> {
+    ) -> Result<Vec<HarmonyMessage>, PromptError> {
         let mut all_messages = Vec::new();
 
         // Handle new vs continuing conversation
@@ -815,7 +818,7 @@ impl HarmonyBuilder {
         &self,
         item: &ResponseInputOutputItem,
         prev_outputs: &[&ResponseInputOutputItem],
-    ) -> Result<HarmonyMessage, String> {
+    ) -> Result<HarmonyMessage, PromptError> {
         match item {
             // Regular message (user or assistant)
             ResponseInputOutputItem::Message { role, content, .. } => {
@@ -917,7 +920,11 @@ impl HarmonyBuilder {
                         }),
                         _ => None,
                     })
-                    .ok_or_else(|| format!("No function call found for call_id: {call_id}"))?;
+                    .ok_or_else(|| {
+                        PromptError::Refused(format!(
+                            "No function call found for call_id: {call_id}"
+                        ))
+                    })?;
 
                 // Create Tool message with "functions.{name}" prefix
                 // IMPORTANT: Must include recipient="assistant" for parser to recognize it.
@@ -929,7 +936,7 @@ impl HarmonyBuilder {
                     },
                     recipient: Some("assistant".to_string()),
                     content: vec![Content::Text(TextContent {
-                        text: output.to_text_only()?,
+                        text: output.to_text_only().map_err(PromptError::Refused)?,
                     })],
                     channel: None,
                     content_type: None,
@@ -965,63 +972,57 @@ impl HarmonyBuilder {
             ResponseInputOutputItem::McpApprovalResponse { .. }
             | ResponseInputOutputItem::ComputerCall { .. }
             | ResponseInputOutputItem::ComputerCallOutput { .. } => {
-                warn!(
+                debug!(
                     function = "parse_response_item_to_harmony_message",
                     "Approval item reached Harmony conversion"
                 );
-                Err("Unsupported input item type".to_string())
+                Err(unsupported_item())
             }
             // Left out before this conversion (see the item loop of
             // `construct_input_messages_with_harmony`).
             ResponseInputOutputItem::McpListTools { .. }
-            | ResponseInputOutputItem::McpApprovalRequest { .. } => {
-                Err("Unsupported input item type".to_string())
-            }
+            | ResponseInputOutputItem::McpApprovalRequest { .. } => Err(unsupported_item()),
 
             ResponseInputOutputItem::ImageGenerationCall { .. } => {
-                warn!(
+                debug!(
                     function = "parse_response_item_to_harmony_message",
                     "image_generation_call input item reached Harmony conversion"
                 );
-                Err("Unsupported input item type".to_string())
+                Err(unsupported_item())
             }
 
             ResponseInputOutputItem::Compaction { .. }
-            | ResponseInputOutputItem::ItemReference { .. } => {
-                Err("Unsupported input item type".to_string())
-            }
+            | ResponseInputOutputItem::ItemReference { .. } => Err(unsupported_item()),
 
             ResponseInputOutputItem::CustomToolCall { .. }
             | ResponseInputOutputItem::CustomToolCallOutput { .. } => {
-                warn!(
+                debug!(
                     function = "parse_response_item_to_harmony_message",
                     "Custom tool item reached Harmony conversion"
                 );
-                Err("Unsupported input item type".to_string())
+                Err(unsupported_item())
             }
 
             ResponseInputOutputItem::ShellCall { .. }
             | ResponseInputOutputItem::ShellCallOutput { .. } => {
-                warn!(
+                debug!(
                     function = "parse_response_item_to_harmony_message",
                     "Shell tool item reached Harmony conversion"
                 );
-                Err("Unsupported input item type".to_string())
+                Err(unsupported_item())
             }
 
             ResponseInputOutputItem::ApplyPatchCall { .. }
             | ResponseInputOutputItem::ApplyPatchCallOutput { .. } => {
-                warn!(
+                debug!(
                     function = "parse_response_item_to_harmony_message",
                     "apply_patch item reached Harmony conversion"
                 );
-                Err("Unsupported input item type".to_string())
+                Err(unsupported_item())
             }
             // T5 schema-only: forced-cascade arm, no behavior.
             ResponseInputOutputItem::LocalShellCall { .. }
-            | ResponseInputOutputItem::LocalShellCallOutput { .. } => {
-                Err("Unsupported input item type".to_string())
-            }
+            | ResponseInputOutputItem::LocalShellCallOutput { .. } => Err(unsupported_item()),
         }
     }
 
@@ -1385,7 +1386,11 @@ mod tests {
             let error = HarmonyBuilder::new()
                 .construct_input_messages_with_harmony(&request)
                 .expect_err("An unmatched tool result must fail after history resolution");
-            assert_eq!(error, "No function call found for call_id: call_weather");
+            assert!(error.is_refusal(), "{error:?}");
+            assert_eq!(
+                error.to_string(),
+                "No function call found for call_id: call_weather"
+            );
         }
     }
 
