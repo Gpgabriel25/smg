@@ -826,6 +826,9 @@ class TestFetchErrorClassification:
         class ClientConnectorDNSError(ClientConnectorError):
             pass
 
+        class ClientSSLError(ClientConnectorError):
+            pass
+
     def typing_processor(self, exc):
         """A processor whose fetch failures are typed by the stand-in client."""
         p = self.processor(exc)
@@ -849,9 +852,10 @@ class TestFetchErrorClassification:
             run(p._fetch(3, _Item("image", "https://a/1.png")))
 
     def test_a_failure_that_names_the_references_host_is_typed_as_the_medias(self):
-        """A connection that cannot be made and a name that does not resolve
-        are the reference's own (client); a timeout, the kernel's connect
-        timeout and an origin 5xx may pass (transient). Each leaves as a
+        """A connection that cannot be made, a name that does not resolve and
+        a TLS failure of the origin are the reference's own (client); a
+        timeout, the kernel's connect timeout and an origin 5xx may pass
+        (transient). Each leaves as a
         fetch fault with its kind, still an `MmProcessorUnavailable`, with
         the fetch-failed words; a timeout, which has none, gets its own."""
         http = self._Http
@@ -875,6 +879,12 @@ class TestFetchErrorClassification:
             ),
             (TimeoutError(), "transient", "timed out"),
             (http.ClientResponseError(503), "transient", None),
+            # The TLS library's generic code is 1, the number of EPERM.
+            (
+                http.ClientSSLError(OSError(1, "certificate verify failed")),
+                "client",
+                None,
+            ),
         ]:
             p = self.typing_processor(exc)
             with pytest.raises(mm_processor.MmMediaFetchFault) as raised:
@@ -885,8 +895,9 @@ class TestFetchErrorClassification:
 
     def test_a_failure_that_does_not_name_the_reference_stays_retryable_and_untyped(self):
         """The worker's own: its proxy (a connector and a response error too,
-        so tested first), its own limits and its lost route inside a
-        connector error, and a loader it lacks. A connector error under
+        so tested first), its own limits, its lost route and its egress
+        rules' permission failure inside a connector error, and a loader it
+        lacks. A connector error under
         another host than the reference's: the proxy's missing name, which
         the client library reports as a plain DNS error, and a redirect's
         target that refuses. A resolver failure that does not say the name
@@ -899,6 +910,8 @@ class TestFetchErrorClassification:
             http.ClientHttpProxyError(502),
             http.ClientConnectorError(OSError(errno.EMFILE, "Too many open files")),
             http.ClientConnectorError(OSError(errno.ENETUNREACH, "Network is unreachable")),
+            http.ClientConnectorError(PermissionError(errno.EACCES, "Permission denied")),
+            http.ClientConnectorError(PermissionError(errno.EPERM, "Operation not permitted")),
             http.ClientConnectorDNSError(
                 socket.gaierror(socket.EAI_NONAME, "Name or service not known"),
                 host="egress-proxy",
@@ -952,6 +965,12 @@ class TestFetchErrorClassification:
         assert classify(aiohttp.ClientProxyConnectionError(key, refused)) is None
         exhausted = OSError(errno.EMFILE, "Too many open files")
         assert classify(aiohttp.ClientConnectorError(key, exhausted)) is None
+        denied = PermissionError(errno.EACCES, "Permission denied")
+        assert classify(aiohttp.ClientConnectorError(key, denied)) is None
+        # A TLS failure carries the TLS library's code 1, the number of EPERM.
+        ssl = pytest.importorskip("ssl")
+        unverified = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        assert classify(aiohttp.ClientConnectorCertificateError(key, unverified)) == "client"
         missing = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
         assert classify(aiohttp.ClientConnectorDNSError(key, missing)) == "client"
         again = socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")

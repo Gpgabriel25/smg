@@ -120,7 +120,8 @@ class MmMediaFetchFault(MmProcessorUnavailable):
 
 # System errors of a connection attempt that name this worker, not the
 # reference's host: its descriptors, buffers, memory or local addresses ran
-# out, or its interface or its route is down. Another worker may connect.
+# out, its interface or its route is down, or its own egress rules refuse
+# the connection (a permission failure). Another worker may connect.
 _LOCAL_CONNECT_ERRNOS = frozenset(
     {
         errno.EMFILE,
@@ -130,6 +131,8 @@ _LOCAL_CONNECT_ERRNOS = frozenset(
         errno.EADDRNOTAVAIL,
         errno.ENETDOWN,
         errno.ENETUNREACH,
+        errno.EACCES,
+        errno.EPERM,
     }
 )
 
@@ -167,8 +170,9 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException, str], str | No
     is the reference's only under the reference's own host
     (`_reference_host`). Under that host, one that wraps one of the
     worker's own limits (`_LOCAL_CONNECT_ERRNOS`) is the worker's as well,
-    and a resolver failure is the reference's only under a code that says
-    the name is missing (`_UNRESOLVED_NAME_CODES`). Everything else that
+    a TLS failure is the origin's whatever code it carries, and a resolver
+    failure is the reference's only under a code that says the name is
+    missing (`_UNRESOLVED_NAME_CODES`). Everything else that
     reaches the fetch arm stays retryable: a loader the worker lacks, a
     decode or a resize failure, an origin 408 or 429, a transfer that
     breaks in the body.
@@ -178,6 +182,7 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException, str], str | No
     proxy = (http.ClientProxyConnectionError, http.ClientHttpProxyError)
     connector = http.ClientConnectorError
     dns = http.ClientConnectorDNSError
+    tls = http.ClientSSLError
     response = http.ClientResponseError
     timeouts = (TimeoutError, asyncio.TimeoutError)
 
@@ -202,6 +207,11 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException, str], str | No
             # not exist; any other resolver failure may be this worker's.
             if isinstance(error, dns):
                 return MEDIA_FAULT_CLIENT if code in _UNRESOLVED_NAME_CODES else None
+            # A TLS failure under the reference's host is its origin's. It is
+            # read by its class: the TLS library's codes share numbers with
+            # the system's (its generic error is 1, as EPERM is).
+            if isinstance(error, tls):
+                return MEDIA_FAULT_CLIENT
             # The worker's own limits arrive inside a connector error too.
             if code in _LOCAL_CONNECT_ERRNOS:
                 return None
