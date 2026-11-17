@@ -2588,6 +2588,9 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_class::<PySglangGrpcServer>()?;
     m.add_class::<PyTrtllmGrpcServer>()?;
+    // The media callback's class: the servicer package's tests read the
+    // kinds it lists.
+    m.add_class::<servicer::MediaDone>()?;
     m.add_class::<PyTokenizer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;

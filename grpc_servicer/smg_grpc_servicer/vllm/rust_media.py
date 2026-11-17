@@ -79,11 +79,12 @@ def kind_for_code(code: grpc.StatusCode) -> str:
 
 def media_fault_kind(done: Any, fault: str) -> str:
     """The outcome kind of a media fault: its own kind where the Rust
-    callback declares that it reads them (`media_fault_kinds`), and
-    unavailable, the answer before the kinds existed, for a binding that
-    predates them: it would read a kind it does not know as internal."""
-    if getattr(done, "media_fault_kinds", False):
-        return _MEDIA_FAULT_KINDS.get(fault, KIND_UNAVAILABLE)
+    callback lists it among the kinds it reads (`media_fault_kinds`), and
+    unavailable, the answer before the kinds existed, where it does not: a
+    binding that predates a kind would read it as internal."""
+    kind = _MEDIA_FAULT_KINDS.get(fault)
+    if kind is not None and kind in getattr(done, "media_fault_kinds", ()):
+        return kind
     return KIND_UNAVAILABLE
 
 

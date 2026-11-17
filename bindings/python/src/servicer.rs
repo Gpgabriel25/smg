@@ -365,18 +365,23 @@ fn lent_bytes(owner: Bound<'_, PyAny>) -> PyResult<Bytes> {
 /// the fetch-failed code, as the gateway's own pipeline on a worker reports
 /// it.
 #[pyclass(name = "_MediaDone")]
-struct MediaDone {
+pub(crate) struct MediaDone {
     tx: Mutex<Option<oneshot::Sender<Result<ProcessedMedia, MediaError>>>>,
 }
 
+/// The outcome kinds of a fetch that failed for the reference's own reason,
+/// as the servicer package's bridge names them.
+const MEDIA_CLIENT_KIND: &str = "media_client";
+const MEDIA_TRANSIENT_KIND: &str = "media_transient";
+
 #[pymethods]
 impl MediaDone {
-    /// Declares that `__call__` reads the media-fault kinds. The servicer
-    /// package sends them only to a callback that says so: one that predates
-    /// them reads a kind it does not know as `internal`.
+    /// The media-fault kinds `__call__` reads. The servicer package sends a
+    /// kind only to a callback that lists it: one that predates a kind reads
+    /// it as `internal`.
     #[classattr]
-    fn media_fault_kinds() -> bool {
-        true
+    fn media_fault_kinds() -> (&'static str, &'static str) {
+        (MEDIA_CLIENT_KIND, MEDIA_TRANSIENT_KIND)
     }
 
     fn __call__(&self, kind: &str, payload: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -407,12 +412,12 @@ impl MediaDone {
             }
             "invalid" => Err(MediaError::Invalid(payload.extract()?)),
             "unavailable" => Err(MediaError::Unavailable(payload.extract()?)),
-            "media_client" => Err(MediaError::Media {
+            MEDIA_CLIENT_KIND => Err(MediaError::Media {
                 fault: smg_grpc_client::WorkerMediaFault::Client,
                 code: MediaErrorCode::FetchFailed.as_str(),
                 message: payload.extract()?,
             }),
-            "media_transient" => Err(MediaError::Media {
+            MEDIA_TRANSIENT_KIND => Err(MediaError::Media {
                 fault: smg_grpc_client::WorkerMediaFault::Transient,
                 code: MediaErrorCode::FetchFailed.as_str(),
                 message: payload.extract()?,

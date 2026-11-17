@@ -5,9 +5,11 @@ Run with: pytest grpc_servicer/tests/test_vllm_mm_processor.py
 
 import argparse
 import asyncio
+import errno
 import importlib.util
 import logging
 import os
+import socket
 import sys
 import types
 from dataclasses import dataclass
@@ -878,12 +880,17 @@ class TestFetchErrorClassification:
 
     def test_a_failure_that_does_not_name_the_reference_stays_retryable_and_untyped(self):
         """The worker's own: its proxy (a connector and a response error too,
-        so tested first) and a loader it lacks. And what stays as it was: an
-        origin 408 or 429, and a transfer that breaks in the body."""
+        so tested first), its own limits and its resolver's "try again"
+        inside a connector error, and a loader it lacks. And what stays as it
+        was: an origin 408 or 429, and a transfer that breaks in the body."""
         http = self._Http
         for exc in [
             http.ClientProxyConnectionError(ConnectionRefusedError(111, "Connect call failed")),
             http.ClientHttpProxyError(502),
+            http.ClientConnectorError(OSError(errno.EMFILE, "Too many open files")),
+            http.ClientConnectorDNSError(
+                socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+            ),
             ImportError("no audio backend"),
             NotImplementedError("load_bytes is not implemented"),
             http.ClientResponseError(429),
@@ -916,6 +923,10 @@ class TestFetchErrorClassification:
             == "transient"
         )
         assert classify(aiohttp.ClientProxyConnectionError(key, refused)) is None
+        exhausted = OSError(errno.EMFILE, "Too many open files")
+        assert classify(aiohttp.ClientConnectorError(key, exhausted)) is None
+        again = socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+        assert classify(aiohttp.ClientConnectorError(key, again)) is None
         assert classify(aiohttp.ServerTimeoutError()) == "transient"
         assert classify(aiohttp.ClientResponseError(None, (), status=502)) == "transient"
         assert classify(aiohttp.ClientResponseError(None, (), status=429)) is None

@@ -20,7 +20,11 @@ from smg_grpc_servicer.vllm.mm_processor import (  # noqa: E402
     MmProcessorUnavailable,
     MmSettings,
 )
-from smg_grpc_servicer.vllm.rust_media import RustMediaBridge  # noqa: E402
+from smg_grpc_servicer.vllm.rust_media import (  # noqa: E402
+    KIND_MEDIA_CLIENT,
+    KIND_MEDIA_TRANSIENT,
+    RustMediaBridge,
+)
 
 
 @pytest.fixture
@@ -173,14 +177,14 @@ def test_failures_are_classified_like_the_python_servicers_statuses(loop):
     assert processor.calls == []
 
 
-def test_a_media_fault_leaves_under_its_own_kind_only_where_the_callback_declares_them(loop):
+def test_a_media_fault_leaves_under_its_own_kind_only_where_the_callback_lists_it(loop):
     """A fetch that failed for the reference's own reason: a callback that
-    declares the media-fault kinds is told the kind, so the status carries
-    the media's fault; a callback that predates them is told unavailable, as
-    before, never a kind it would read as internal."""
+    lists the media-fault kind is told the kind, so the status carries the
+    media's fault; a callback that does not list it, or predates the kinds,
+    is told unavailable, as before, never a kind it would read as internal."""
 
     class Declaring:
-        media_fault_kinds = True
+        media_fault_kinds = (KIND_MEDIA_CLIENT, KIND_MEDIA_TRANSIENT)
 
         def __init__(self):
             self.answers: queue.Queue = queue.Queue()
@@ -197,6 +201,23 @@ def test_a_media_fault_leaves_under_its_own_kind_only_where_the_callback_declare
         )
         assert done.answers.get(timeout=5) == (kind, words)
         assert submit(bridge(loop, FakeProcessor(failure))) == ("unavailable", words)
+
+    class OnlyClient(Declaring):
+        media_fault_kinds = (KIND_MEDIA_CLIENT,)
+
+    done = OnlyClient()
+    bridge(loop, FakeProcessor(MmMediaFetchFault("transient", words))).submit(
+        "r2", [1, 2, 3], "describe", [("image", "https://x/y.png")], 123.5, False, done
+    )
+    assert done.answers.get(timeout=5) == ("unavailable", words)
+
+
+def test_the_bindings_callback_lists_the_kinds_the_bridge_sends():
+    """Where the binding is installed: its callback lists exactly the
+    media-fault kinds the bridge sends, so a name that changes on one side
+    fails here and not as a quiet return to unavailable."""
+    smg_rs = pytest.importorskip("smg.smg_rs")
+    assert set(smg_rs._MediaDone.media_fault_kinds) == {KIND_MEDIA_CLIENT, KIND_MEDIA_TRANSIENT}
 
 
 def test_probe_reports_the_processors_answer_and_current_schemes(loop):

@@ -11,11 +11,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import errno
 import inspect
 import json
 import logging
 import os
 import re
+import socket
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping, Sequence
@@ -115,6 +117,21 @@ class MmMediaFetchFault(MmProcessorUnavailable):
         self.fault = fault
 
 
+# System errors of a connection attempt that name this worker, not the
+# reference's host: its descriptors, buffers, memory or local addresses ran
+# out, or its resolver cannot answer for now. Another worker may connect.
+_LOCAL_CONNECT_ERRNOS = frozenset(
+    {
+        errno.EMFILE,
+        errno.ENFILE,
+        errno.ENOBUFS,
+        errno.ENOMEM,
+        errno.EADDRNOTAVAIL,
+        socket.EAI_AGAIN,
+    }
+)
+
+
 def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
     """The media-fault kind of a fetch failure, read from its type, or None
     for one that stays the worker's and retryable. `http` is the HTTP client
@@ -122,7 +139,9 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
 
     An allow-list: only what names the reference's host or origin is typed.
     The proxy's own failures are the worker's egress, and are tested first
-    because they are connector and response errors too. Everything else that
+    because they are connector and response errors too. A connector error
+    that wraps one of the worker's own limits (`_LOCAL_CONNECT_ERRNOS`) is
+    the worker's as well. Everything else that
     reaches the fetch arm stays retryable: a loader the worker lacks, a
     decode or a resize failure, an origin 408 or 429, a transfer that breaks
     in the body.
@@ -140,9 +159,13 @@ def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
         if isinstance(error, timeouts):
             return MEDIA_FAULT_TRANSIENT
         if isinstance(error, connector):
+            os_error = getattr(error, "os_error", None)
             # The kernel's connect timeout arrives inside a connector error.
-            if isinstance(getattr(error, "os_error", None), timeouts):
+            if isinstance(os_error, timeouts):
                 return MEDIA_FAULT_TRANSIENT
+            # So do the worker's own limits and its resolver's "try again".
+            if getattr(os_error, "errno", None) in _LOCAL_CONNECT_ERRNOS:
+                return None
             return MEDIA_FAULT_CLIENT
         if isinstance(error, response) and error.status >= 500:
             return MEDIA_FAULT_TRANSIENT
