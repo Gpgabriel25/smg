@@ -492,6 +492,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     ("hermes-4-14b", GenerationPrompt::Plain),
     ("granite-4.1-3b", GenerationPrompt::Plain),
+    ("granite-guardian-4.1-8b", GenerationPrompt::Plain),
+    ("granite-4.0-h-3b-ar", GenerationPrompt::Plain),
     ("granite-switch-4.1-8b", GenerationPrompt::Plain),
     ("ai21-jamba2-3b", GenerationPrompt::Plain),
     ("step-3.5-flash", GenerationPrompt::AlwaysOpensTheThought),
@@ -539,6 +541,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "seed-oss-36b-instruct",
         GenerationPrompt::ModelWritesTheThought,
     ),
+    ("seed-oss-36b-base", GenerationPrompt::ModelWritesTheThought),
     // Keyed arguments, each family under its own markers; the prompt opens the thought, Hy4's
     // whatever the request says.
     ("hy4-preview", GenerationPrompt::AlwaysOpensTheThought),
@@ -573,6 +576,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // assistant turn without a thinking field, so bellwether records five of its sixteen common
     // cases, the reasoning ones and the thinking-on call.
     ("k2-horizon-36b", GenerationPrompt::AlwaysOpensTheThought),
+    ("k2-horizon-7b", GenerationPrompt::AlwaysOpensTheThought),
     // The Jais 3 line (two groups: the dense checkpoints under the 32B, the MoVA one on its own
     // tokenizer) writes K2-Horizon's shape on a template of its own: the thought opened by the
     // prompt whatever `enable_thinking` says (`reasoning_effort` picks the tag, `<ifm|think>` by
@@ -610,10 +614,14 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
+    ("olmo-hybrid-instruct-dpo-7b", GenerationPrompt::Plain),
     ("lfm2.5-1.2b-instruct", GenerationPrompt::ModelDecides),
+    ("lfm2.5-350m", GenerationPrompt::ModelDecides),
+    ("lfm2-24b-a2b", GenerationPrompt::ModelDecides),
     // LFM2.5-24B-A2B's template opens the thought in the prompt whatever the request says (`<think>`
     // after the assistant header, no newline, in both thinking settings of its render set).
     ("lfm2.5-24b-a2b", GenerationPrompt::AlwaysOpensTheThought),
+    ("lfm2.5-2.6b", GenerationPrompt::AlwaysOpensTheThought),
     // Llama 4's list stands bare in the turn after the content, every value between double
     // quotes; the template has no thought and ends the generation prompt with the opener and two
     // newlines, which the shared tail does not write and the replay does not need.
@@ -624,6 +632,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     // A bare JSON list of calls, or content; no thought.
     ("llama-xlam-2-8b-fc-r", GenerationPrompt::Plain),
+    ("llama-xlam-2-70b-fc-r", GenerationPrompt::Plain),
     // The Mistral list behind `[TOOL_CALLS]`; Mistral Small 3's template renders no tool call,
     // so its recorded sets hold content alone, and no thought.
     ("mistral-small-24b-instruct-2501", GenerationPrompt::Plain),
@@ -648,6 +657,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // colgrep-agent-2B (a MiniCPM5-2B fine-tune) writes the MiniCPM5-2B base template: the same
     // prompt shapes, the model writing its own `<think>`.
     ("colgrep-agent-2b", GenerationPrompt::ModelWritesTheThought),
+    ("minicpm5-2b-sft", GenerationPrompt::ModelWritesTheThought),
+    ("minicpm5-2b-base", GenerationPrompt::ModelWritesTheThought),
     // dots3: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
     // prompt.
     ("dots3-note-prev", GenerationPrompt::ModelWritesTheThought),
@@ -657,6 +668,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
     // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
     ("gemma-4-e4b-it", GenerationPrompt::ModelDecides),
+    (
+        "gemma-4-e2b-it-qat-q4-0-unquantized",
+        GenerationPrompt::ModelDecides,
+    ),
     // OTel-2.0-LLM-31B-IT (a Gemma 4 stack) writes Gemma 4's template with a comment block added at
     // the generation prompt and nothing else: the prompt is the turn's opener alone; the model
     // writes `<|channel>thought` or not.
@@ -897,6 +912,7 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // thought in the prompt under its own opener; AReaL-SEA and the tau2 SFT open it whatever the
     // request says; the boba-2 line and the tau2 user SFT leave it to the model.
     ("areal-boba-2-14b", GenerationPrompt::ModelWritesTheThought),
+    ("huatuogpt-3-8b", GenerationPrompt::ModelWritesTheThought),
     ("sera-32b", GenerationPrompt::ModelWritesTheThought),
     ("sdar-30b-a3b-chat", GenerationPrompt::ModelWritesTheThought),
     ("qwen3-8b-abc", GenerationPrompt::ModelWritesTheThought),
@@ -944,9 +960,12 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "bytedance-seed-oss-36b-alternate-tokenizer",
         GenerationPrompt::Plain,
     ),
+    ("hermes-4-70b", GenerationPrompt::Plain),
+    ("hermes-4-405b", GenerationPrompt::Plain),
     ("hermes-4.3-36b-centralized", GenerationPrompt::Plain),
     ("hermes-4.3-36b", GenerationPrompt::Plain),
     ("caller", GenerationPrompt::Plain),
+    ("arcee-blitz-caller-beta", GenerationPrompt::Plain),
     ("caprl-3b", GenerationPrompt::Plain),
     ("caprl-eval-3b", GenerationPrompt::Plain),
     ("cogalign-internvl2-5-mpo-4b", GenerationPrompt::Plain),
@@ -1355,6 +1374,14 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
     (
+        "granite-guardian-4.1-8b",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
+    (
+        "granite-4.0-h-3b-ar",
+        "<|start_of_role|>assistant<|end_of_role|>",
+    ),
+    (
         "granite-switch-4.1-8b",
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
@@ -1365,6 +1392,14 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
     ("a.x-4.0-light", "<|im_start|><|assistant|>"),
     (
         "bytedance-seed-oss-36b-alternate-tokenizer",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "hermes-4-70b",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "hermes-4-405b",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
     (

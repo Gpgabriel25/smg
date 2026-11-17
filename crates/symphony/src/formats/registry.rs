@@ -922,6 +922,66 @@ mod tests {
         }
     }
 
+    /// A checkpoint that bellwether records with the chat template of a group the registry
+    /// already reads, and whose own recorded parse cases replay on that group's table, has a
+    /// row of its own on that table, with the group's turn opener and text after the
+    /// thought's close. Each pair is such a checkpoint and the group whose template it has.
+    #[test]
+    fn a_checkpoint_with_a_groups_chat_template_reads_like_that_group() {
+        for (model, group) in [
+            ("arcee-ai/arcee-blitz-caller-beta", "arcee-ai/Caller"),
+            (
+                "google/gemma-4-E2B-it-qat-q4_0-unquantized",
+                "google/gemma-4-E4B-it",
+            ),
+            (
+                "ibm-research/granite-4.0-h-3b-ar",
+                "ibm-granite/granite-4.1-3b",
+            ),
+            (
+                "ibm-granite/granite-guardian-4.1-8b",
+                "ibm-granite/granite-4.1-3b",
+            ),
+            (
+                "NousResearch/Hermes-4-405B",
+                "NousResearch/ByteDance-Seed-OSS-36B-Alternate-Tokenizer",
+            ),
+            (
+                "NousResearch/Hermes-4-70B",
+                "NousResearch/ByteDance-Seed-OSS-36B-Alternate-Tokenizer",
+            ),
+            (
+                "FreedomIntelligence/HuatuoGPT-3-8B",
+                "inclusionAI/AReaL-boba-2-14B",
+            ),
+            ("IFM/K2-Horizon-7B", "IFM/K2-Horizon-36B"),
+            ("LiquidAI/LFM2-24B-A2B", "LiquidAI/LFM2.5-1.2B-Instruct"),
+            ("LiquidAI/LFM2.5-2.6B", "LiquidAI/LFM2.5-24B-A2B"),
+            ("LiquidAI/LFM2.5-350M", "LiquidAI/LFM2.5-1.2B-Instruct"),
+            (
+                "Salesforce/Llama-xLAM-2-70b-fc-r",
+                "Salesforce/Llama-xLAM-2-8b-fc-r",
+            ),
+            ("openbmb/MiniCPM5-2B-Base", "lightonai/colgrep-agent-2B"),
+            ("openbmb/MiniCPM5-2B-SFT", "lightonai/colgrep-agent-2B"),
+            (
+                "allenai/Olmo-Hybrid-Instruct-DPO-7B",
+                "allenai/Olmo-3-7B-Instruct",
+            ),
+            (
+                "ByteDance-Seed/Seed-OSS-36B-Base",
+                "ByteDance-Seed/Seed-OSS-36B-Instruct",
+            ),
+        ] {
+            assert!(for_model(model).is_some(), "{model}");
+            assert_eq!(
+                for_model(model),
+                for_model(group),
+                "{model}: reads like {group}"
+            );
+        }
+    }
+
     #[test]
     fn a_model_the_registry_does_not_know_resolves_to_none() {
         for model in [
