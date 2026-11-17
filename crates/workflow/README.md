@@ -253,8 +253,10 @@ Options:
 - `FailureAction::ContinueNextStep` - Skip failed step, continue workflow
 - `FailureAction::RetryIndefinitely` - Keep retrying until manual intervention
 
-A step that panics is a failed step: the panic's message is logged, the step's state reads `Step failed`,
-its failure action applies, and no further attempt is made whatever its retry policy says.
+A step that panics is a failed step: the panic's message is logged, the step's state reads `Failed` with the
+error text `Step failed`, its failure action applies, and no further attempt is made whatever its retry
+policy says. A panic in a step's `on_success` or `on_failure` hook is logged the same way and leaves the
+outcome the step has written, as a hook that returns an error does.
 
 ## Conditional Execution
 

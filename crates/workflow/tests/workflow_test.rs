@@ -14,10 +14,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 use wfaas::{
-    BackoffStrategy, FailureAction, InMemoryStore, LoggingSubscriber, RetryPolicy, StateStore,
-    StepDefinition, StepExecutor, StepId, StepResult, StepStatus, ValidationError, WorkflowContext,
-    WorkflowData, WorkflowDefinition, WorkflowEngine, WorkflowError, WorkflowInstanceId,
-    WorkflowResult, WorkflowState, WorkflowStatus,
+    BackoffStrategy, EventSubscriber, FailureAction, InMemoryStore, LoggingSubscriber, RetryPolicy,
+    StateStore, StepDefinition, StepExecutor, StepId, StepResult, StepStatus, ValidationError,
+    WorkflowContext, WorkflowData, WorkflowDefinition, WorkflowEngine, WorkflowError,
+    WorkflowEvent, WorkflowInstanceId, WorkflowResult, WorkflowState, WorkflowStatus,
 };
 
 /// Test workflow data type for integration tests.
@@ -2203,5 +2203,148 @@ async fn a_step_that_panics_leaves_its_independent_sibling_running() {
     assert!(
         c_ran.unwrap() >= Duration::from_millis(SIBLING_RUN_MS),
         "the sibling was cut short after {c_ran:?}"
+    );
+}
+
+// ============================================================================
+// A Hook That Panics
+// ============================================================================
+
+/// The error the step with a panicking hook fails with.
+const OWN_ERROR: &str = "the step's own error";
+
+/// A step that succeeds or fails with [`OWN_ERROR`], as `succeeds` says, and
+/// whose hook for that end panics.
+struct PanickingHookStep {
+    succeeds: bool,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for PanickingHookStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        if self.succeeds {
+            Ok(StepResult::Success)
+        } else {
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("boom"),
+                message: OWN_ERROR.to_string(),
+            })
+        }
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+
+    #[expect(clippy::panic, reason = "the hook under test is one that panics")]
+    async fn on_success(&self, _context: &WorkflowContext<TestWorkflowData>) -> WorkflowResult<()> {
+        panic!("{PANIC_TEXT}");
+    }
+
+    #[expect(clippy::panic, reason = "the hook under test is one that panics")]
+    async fn on_failure(
+        &self,
+        _context: &WorkflowContext<TestWorkflowData>,
+        _error: &WorkflowError,
+    ) -> WorkflowResult<()> {
+        panic!("{PANIC_TEXT}");
+    }
+}
+
+/// Counts the succeeded and the failed events of the step `boom`.
+#[derive(Default)]
+struct BoomEnds {
+    succeeded: AtomicU32,
+    failed: AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl EventSubscriber for BoomEnds {
+    async fn on_event(&self, event: &WorkflowEvent) {
+        let boom = StepId::new("boom");
+        match event {
+            WorkflowEvent::StepSucceeded { step_id, .. } if *step_id == boom => {
+                self.succeeded.fetch_add(1, Ordering::SeqCst);
+            }
+            WorkflowEvent::StepFailed { step_id, .. } if *step_id == boom => {
+                self.failed.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The step `boom` with a panicking hook, in a workflow whose second step
+/// depends on it, and the counter of `boom`'s events.
+async fn hook_run(
+    id: &str,
+    succeeds: bool,
+) -> (
+    Result<WorkflowState<TestWorkflowData>, String>,
+    Arc<BoomEnds>,
+) {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let ends = Arc::new(BoomEnds::default());
+    let subscriber: Arc<dyn EventSubscriber> = Arc::<BoomEnds>::clone(&ends);
+    engine.event_bus().subscribe(subscriber).await;
+    let workflow = WorkflowDefinition::new(id, "Panicking hook")
+        .add_step(StepDefinition::new(
+            "boom",
+            "Step whose hook panics",
+            Arc::new(PanickingHookStep { succeeds }),
+        ))
+        .add_step(
+            StepDefinition::new("after", "Step after the panic", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["boom"]),
+        );
+    let state = ended(&engine, workflow).await;
+    // The events are delivered on tasks of their own.
+    sleep(Duration::from_millis(100)).await;
+    (state, ends)
+}
+
+#[tokio::test]
+async fn a_failure_hook_that_panics_leaves_the_failure_the_step_wrote() {
+    // The step fails with its own error. The engine writes that failure and
+    // sends its event, then calls the failure hook, which panics: the caller
+    // still reads the step's own error, and one failed event went out.
+    let (state, ends) = hook_run("failing_with_a_panicking_hook", false).await;
+    let state = state.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let step = &state.step_states[&StepId::new("boom")];
+    assert_eq!(step.status, StepStatus::Failed);
+    let own_error = WorkflowError::StepFailed {
+        step_id: StepId::new("boom"),
+        message: OWN_ERROR.to_string(),
+    };
+    assert_eq!(step.last_error, Some(own_error.to_string()));
+    assert_eq!(ends.failed.load(Ordering::SeqCst), 1);
+    assert!(!format!("{state:?}").contains(PANIC_TEXT));
+}
+
+#[tokio::test]
+async fn a_success_hook_that_panics_leaves_the_success_the_step_wrote() {
+    // The step succeeds. The engine writes the success and sends its event,
+    // then calls the success hook, which panics: the step stays succeeded,
+    // the step that depends on it runs, and no failed event goes out.
+    let (state, ends) = hook_run("succeeding_with_a_panicking_hook", true).await;
+    let state = state.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    let step = &state.step_states[&StepId::new("boom")];
+    assert_eq!(step.status, StepStatus::Succeeded);
+    assert_eq!(step.last_error, None);
+    assert_eq!(
+        state.step_states[&StepId::new("after")].status,
+        StepStatus::Succeeded
+    );
+    assert_eq!(
+        (
+            ends.succeeded.load(Ordering::SeqCst),
+            ends.failed.load(Ordering::SeqCst)
+        ),
+        (1, 0)
     );
 }

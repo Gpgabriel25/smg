@@ -981,11 +981,15 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         }
     }
 
-    /// The end of a step whose task panicked: a failed step's end. The step's
-    /// state and its failed event carry the text of a plain failure, and the
-    /// step's failure action applies. No attempt follows, whatever the retry
-    /// policy says, and the executor's failure hook is not called: the
-    /// executor is what panicked.
+    /// The end of a step whose task panicked. A step that had written its
+    /// outcome keeps it, as it does when a hook returns an error: the panic
+    /// came after the outcome, from the hook that follows it, so a succeeded
+    /// step ends as succeeded and a failed step as failed, with the state and
+    /// the events it has. Any other step ends as a failed step: its state and
+    /// its failed event carry the text of a plain failure. A failure's action
+    /// applies either way. No attempt follows, whatever the retry policy says,
+    /// and the executor's failure hook is not called: the executor is what
+    /// panicked.
     async fn settle_panicked(
         &self,
         step: &StepDefinition<D>,
@@ -997,17 +1001,32 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         if !tracker.read().running.contains(&step.id) {
             return;
         }
-        if let Err(e) = self
-            .record_failure(instance_id, step, PLAIN_FAILURE, false)
+        // What the step wrote before the panic. `Succeeded` and `Failed` are
+        // written once, as the step's outcome, right before its hook runs.
+        let written = self
+            .state_store
+            .load(instance_id)
             .await
-        {
-            tracing::warn!(
-                step_id = %step.id,
-                error = ?e,
-                "Failed to record a panicked step as failed"
-            );
-        }
-        let completion = Completion::of(Ok(StepResult::Failure), step.on_failure);
+            .ok()
+            .and_then(|state| state.step_states.get(&step.id).map(|s| s.status));
+        let result = match written {
+            Some(StepStatus::Succeeded) => StepResult::Success,
+            Some(StepStatus::Failed) => StepResult::Failure,
+            _ => {
+                if let Err(e) = self
+                    .record_failure(instance_id, step, PLAIN_FAILURE, false)
+                    .await
+                {
+                    tracing::warn!(
+                        step_id = %step.id,
+                        error = ?e,
+                        "Failed to record a panicked step as failed"
+                    );
+                }
+                StepResult::Failure
+            }
+        };
+        let completion = Completion::of(Ok(result), step.on_failure);
         Self::settle(tracker, tx, &step.id, completion.signal);
         if let Some((status, last_error)) = completion.state {
             self.record_step_status(instance_id, &step.id, status, last_error)
