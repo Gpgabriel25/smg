@@ -3020,14 +3020,22 @@ impl NativeEncoder {
                 // single-stage scanners' loop; the walk's other ends call it
                 // through `Scanner::aside`. Out of line at every end it is a
                 // call per piece, nine to eighteen instructions per token.
+                // Only the probe's hit is compiled in
+                // (`tokenize_piece_in_place`): with the whole probe there the
+                // walk kept less of its state in registers around a hit.
                 chain.pieces(
                     text,
                     words,
                     #[inline(always)]
                     |start, end| {
-                        if let Err(declined) =
-                            self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
-                        {
+                        if let Err(declined) = self.tokenize_piece_in_place(
+                            model,
+                            text,
+                            start..end,
+                            mapped,
+                            ids,
+                            cache,
+                        ) {
                             fallback = Some(declined);
                         }
                     },
@@ -3365,6 +3373,74 @@ impl NativeEncoder {
             None => None,
         };
         self.tokenize_piece_slow(model, &text.as_bytes()[piece], vacancy, mapped, ids, cache)
+    }
+
+    /// [`Self::tokenize_piece_at`] for a walk that compiles the probe into
+    /// its loop, with only the packed table's answer compiled in there: the
+    /// key by its one read of the text, the probe, an entry's inline ids. A
+    /// piece longer than a key goes to the slow path as it does from
+    /// [`Self::tokenize_piece_at`] (the wide table or the map answers it on
+    /// a warm encode, so it is no rare piece), and every other piece leaves
+    /// the loop by one call, cold and out of line
+    /// ([`Self::tokenize_missed_piece`]). So the loop holds the code of a
+    /// hit and two calls, and the walk keeps its registers for the hit: with
+    /// the whole probe in the loop (the key's second read, the spill, the
+    /// seed's call and the slow path's after it) a hit ran six instructions
+    /// more and jumped over that code. Counted on a chain vocabulary's warm
+    /// encodes, against the probe out of line: a call runs 6.5 % fewer
+    /// instructions on a 2k-token text and 9.4 % fewer on a 32k-token one,
+    /// where the whole probe in the loop saved 5.1 % and 8.8 %.
+    #[inline(always)]
+    fn tokenize_piece_in_place(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let bytes = text.as_bytes();
+        match ShortPieceKey::in_window(bytes, piece.start, piece.end) {
+            Some(key) => match cache.packed.lookup_inline(key, ids) {
+                Ok(()) => Ok(()),
+                Err(missed) => {
+                    self.tokenize_missed_piece(model, text, piece, missed, mapped, ids, cache)
+                }
+            },
+            None if piece.len() > SHORT_PIECE_MAX_BYTES => {
+                self.tokenize_piece_slow(model, &bytes[piece], None, mapped, ids, cache)
+            }
+            None => self.tokenize_missed_piece(model, text, piece, None, mapped, ids, cache),
+        }
+    }
+
+    /// The rest of [`Self::tokenize_piece_in_place`], for a short piece its
+    /// loop did not answer. A probe that ended on a vacancy goes on as
+    /// [`Self::tokenize_piece_at`] does after its probe, the seed and then
+    /// the slow path, with no second probe; a piece the loop did not probe
+    /// to the end (no key by the one read, near the end of the text, or ids
+    /// in the spill) takes [`Self::tokenize_piece_at`] whole.
+    #[cold]
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments)]
+    fn tokenize_missed_piece(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        missed: Option<Vacancy>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let Some(vacancy) = missed else {
+            return self.tokenize_piece_at(model, text, piece, mapped, ids, cache);
+        };
+        if self.seeded(vacancy, ids, cache) {
+            return Ok(());
+        }
+        self.tokenize_piece_slow(model, &text.as_bytes()[piece], missed, mapped, ids, cache)
     }
 
     /// [`Self::tokenize_piece_at`] for a gap between two matches of a
