@@ -5,7 +5,7 @@
 //! writes that WARN only for a cause typed as the request's own. Every other failure keeps an
 //! ERROR line: the stage's own where it answers 400 for a fault of the deployment (a model
 //! configuration that does not load, a vocabulary without the placeholder token, a tokenizer
-//! with no chat template or whose encode fails), the pipeline's too in the server's class.
+//! with no chat template), the pipeline's too in the server's class.
 
 use llm_tokenizer::traits::{Encoder, Encoding, SpecialTokens};
 use tracing::Level;
