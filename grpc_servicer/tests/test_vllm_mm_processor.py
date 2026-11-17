@@ -795,6 +795,38 @@ class TestFetchErrorClassification:
         async def fetch_image_async(self, url):
             raise self.exc
 
+    class _Http:
+        """Stands in for the fetcher's HTTP client library: the exception
+        classes the classifier reads, with the library's own inheritance."""
+
+        class ClientError(Exception):
+            pass
+
+        class ClientResponseError(ClientError):
+            def __init__(self, status):
+                super().__init__(f"{status}, message='the origin said so'")
+                self.status = status
+
+        class ClientHttpProxyError(ClientResponseError):
+            pass
+
+        class ClientConnectorError(ClientError, OSError):
+            def __init__(self, os_error):
+                super().__init__(f"Cannot connect to host a:443 ssl:default [{os_error}]")
+                self.os_error = os_error
+
+        class ClientProxyConnectionError(ClientConnectorError):
+            pass
+
+        class ClientConnectorDNSError(ClientConnectorError):
+            pass
+
+    def typing_processor(self, exc):
+        """A processor whose fetch failures are typed by the stand-in client."""
+        p = self.processor(exc)
+        p._fetch_fault = mm_processor.fetch_fault_classifier(self._Http)
+        return p
+
     def processor(self, exc):
         p = mm_processor.InProcessMediaProcessor.__new__(mm_processor.InProcessMediaProcessor)
         p._connector = self._Connector(exc)
@@ -810,6 +842,85 @@ class TestFetchErrorClassification:
             match="media_refs\\[3\\]: fetch failed: image fetch timed out",
         ):
             run(p._fetch(3, _Item("image", "https://a/1.png")))
+
+    def test_a_failure_that_names_the_references_host_is_typed_as_the_medias(self):
+        """A connection that cannot be made and a name that does not resolve
+        are the reference's own (client); a timeout, the kernel's connect
+        timeout and an origin 5xx may pass (transient). Each leaves as a
+        fetch fault with its kind, still an `MmProcessorUnavailable`, with
+        the fetch-failed words; a timeout, which has none, gets its own."""
+        http = self._Http
+        for exc, fault, words in [
+            (
+                http.ClientConnectorError(ConnectionRefusedError(111, "Connect call failed")),
+                "client",
+                None,
+            ),
+            (
+                http.ClientConnectorDNSError(OSError(-2, "Name or service not known")),
+                "client",
+                None,
+            ),
+            (
+                http.ClientConnectorError(TimeoutError(110, "Connection timed out")),
+                "transient",
+                None,
+            ),
+            (TimeoutError(), "transient", "timed out"),
+            (http.ClientResponseError(503), "transient", None),
+        ]:
+            p = self.typing_processor(exc)
+            with pytest.raises(mm_processor.MmMediaFetchFault) as raised:
+                run(p._fetch(3, _Item("image", "https://a/1.png")))
+            assert raised.value.fault == fault, repr(exc)
+            assert str(raised.value) == f"media_refs[3]: fetch failed: {words or exc}", repr(exc)
+            assert isinstance(raised.value, mm_processor.MmProcessorUnavailable)
+
+    def test_a_failure_that_does_not_name_the_reference_stays_retryable_and_untyped(self):
+        """The worker's own: its proxy (a connector and a response error too,
+        so tested first) and a loader it lacks. And what stays as it was: an
+        origin 408 or 429, and a transfer that breaks in the body."""
+        http = self._Http
+        for exc in [
+            http.ClientProxyConnectionError(ConnectionRefusedError(111, "Connect call failed")),
+            http.ClientHttpProxyError(502),
+            ImportError("no audio backend"),
+            NotImplementedError("load_bytes is not implemented"),
+            http.ClientResponseError(429),
+            http.ClientResponseError(408),
+            http.ClientError("Response payload is not completed"),
+        ]:
+            p = self.typing_processor(exc)
+            with pytest.raises(mm_processor.MmProcessorUnavailable) as raised:
+                run(p._fetch(0, _Item("image", "https://a/1.png")))
+            assert type(raised.value) is mm_processor.MmProcessorUnavailable, repr(exc)
+            assert str(raised.value) == f"media_refs[0]: fetch failed: {exc}", repr(exc)
+
+    def test_a_processor_built_without_the_classifier_types_nothing(self):
+        p = self.processor(TimeoutError("image fetch timed out"))
+        with pytest.raises(mm_processor.MmProcessorUnavailable) as raised:
+            run(p._fetch(0, _Item("image", "https://a/1.png")))
+        assert type(raised.value) is mm_processor.MmProcessorUnavailable
+
+    def test_the_classifier_reads_the_http_clients_own_exceptions(self):
+        """The same table over the real library, where it is installed: its
+        proxy errors are connector and response errors, its timeouts are
+        timeout errors, and a broken transfer is none of the typed ones."""
+        aiohttp = pytest.importorskip("aiohttp")
+        classify = mm_processor.fetch_fault_classifier(aiohttp)
+        key = types.SimpleNamespace(host="a", port=443, ssl=True, is_ssl=True)
+        refused = ConnectionRefusedError(111, "Connect call failed")
+        assert classify(aiohttp.ClientConnectorError(key, refused)) == "client"
+        assert (
+            classify(aiohttp.ClientConnectorError(key, TimeoutError(110, "timed out")))
+            == "transient"
+        )
+        assert classify(aiohttp.ClientProxyConnectionError(key, refused)) is None
+        assert classify(aiohttp.ServerTimeoutError()) == "transient"
+        assert classify(aiohttp.ClientResponseError(None, (), status=502)) == "transient"
+        assert classify(aiohttp.ClientResponseError(None, (), status=429)) is None
+        assert classify(aiohttp.ClientHttpProxyError(None, (), status=502)) is None
+        assert classify(aiohttp.ClientPayloadError("Response payload is not completed")) is None
 
     def test_caller_errors_pass_through(self):
         p = self.processor(self._CallerError("415 Unsupported Media Type"))

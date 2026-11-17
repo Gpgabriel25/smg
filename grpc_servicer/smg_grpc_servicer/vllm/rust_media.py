@@ -28,8 +28,11 @@ import grpc
 
 from smg_grpc_servicer.vllm.media_refs import MediaRefItem, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
+    MEDIA_FAULT_CLIENT,
+    MEDIA_FAULT_TRANSIENT,
     MODE_INPROCESS,
     MODE_OFF,
+    MmMediaFetchFault,
     MmProcessorUnavailable,
     MmSettings,
     build_mm_processor,
@@ -42,6 +45,15 @@ KIND_OK = "ok"
 KIND_INVALID = "invalid"
 KIND_UNAVAILABLE = "unavailable"
 KIND_INTERNAL = "internal"
+# A media fetch that failed for the reference's own reason: Rust reports it
+# as the media's fault (the media-fault trailer), so the gateway answers for
+# the media and does not replay the request.
+KIND_MEDIA_CLIENT = "media_client"
+KIND_MEDIA_TRANSIENT = "media_transient"
+_MEDIA_FAULT_KINDS = {
+    MEDIA_FAULT_CLIENT: KIND_MEDIA_CLIENT,
+    MEDIA_FAULT_TRANSIENT: KIND_MEDIA_TRANSIENT,
+}
 
 _RETRYABLE_CODES = (
     grpc.StatusCode.UNAVAILABLE,
@@ -63,6 +75,16 @@ def kind_for_code(code: grpc.StatusCode) -> str:
     if code in _CALLER_CODES:
         return KIND_INVALID
     return KIND_INTERNAL
+
+
+def media_fault_kind(done: Any, fault: str) -> str:
+    """The outcome kind of a media fault: its own kind where the Rust
+    callback declares that it reads them (`media_fault_kinds`), and
+    unavailable, the answer before the kinds existed, for a binding that
+    predates them: it would read a kind it does not know as internal."""
+    if getattr(done, "media_fault_kinds", False):
+        return _MEDIA_FAULT_KINDS.get(fault, KIND_UNAVAILABLE)
+    return KIND_UNAVAILABLE
 
 
 def lend_buffer(buffer: Any) -> Any:
@@ -309,9 +331,15 @@ class RustMediaBridge:
     def _finish(request_id: str, future: Future, done: Callable[[str, Any], None]) -> None:
         """Classify the outcome the way the Python servicer maps it to a
         status (`kind_for_code`): retryable failures UNAVAILABLE, the caller's
-        INVALID_ARGUMENT and NOT_FOUND, anything else INTERNAL."""
+        INVALID_ARGUMENT and NOT_FOUND, anything else INTERNAL. A media fault
+        leaves under its own kind (`media_fault_kind`)."""
         try:
             result = future.result()
+        except MmMediaFetchFault as e:
+            logger.warning(
+                "Media of request %s could not be fetched (%s): %s", request_id, e.fault, e
+            )
+            done(media_fault_kind(done, e.fault), str(e))
         except MmProcessorUnavailable as e:
             logger.warning("Media processing unavailable for request %s: %s", request_id, e)
             done(KIND_UNAVAILABLE, str(e))

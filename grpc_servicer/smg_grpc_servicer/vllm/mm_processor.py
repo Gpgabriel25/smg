@@ -18,7 +18,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Iterable, Mapping, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping, Sequence
 from typing import Any
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
@@ -90,6 +90,69 @@ MIN_VLLM_VERSION = "0.20.0"
 
 class MmProcessorUnavailable(Exception):
     """Retryable backend failure (sidecar down, overloaded, timed out)."""
+
+
+# The gateway's media-fault kinds, as the media-fault trailer names them.
+MEDIA_FAULT_CLIENT = "client"
+MEDIA_FAULT_TRANSIENT = "transient"
+
+
+class MmMediaFetchFault(MmProcessorUnavailable):
+    """A reference's fetch that failed for the reference's own reason.
+
+    `fault` is `MEDIA_FAULT_CLIENT` when the connection could not be made or
+    the name does not resolve (any worker meets the same host), and
+    `MEDIA_FAULT_TRANSIENT` for a timeout or an origin 5xx (the same
+    reference may load later). A servicer that reads the kind reports the
+    failure as the media's, so the gateway answers for the media at once and
+    neither replays the request nor counts it against the worker. It is
+    still an `MmProcessorUnavailable`: a caller that does not read the kind
+    keeps the retryable answer.
+    """
+
+    def __init__(self, fault: str, message: str) -> None:
+        super().__init__(message)
+        self.fault = fault
+
+
+def fetch_fault_classifier(http: Any) -> Callable[[BaseException], str | None]:
+    """The media-fault kind of a fetch failure, read from its type, or None
+    for one that stays the worker's and retryable. `http` is the HTTP client
+    library the fetcher uses: its exception classes.
+
+    An allow-list: only what names the reference's host or origin is typed.
+    The proxy's own failures are the worker's egress, and are tested first
+    because they are connector and response errors too. Everything else that
+    reaches the fetch arm stays retryable: a loader the worker lacks, a
+    decode or a resize failure, an origin 408 or 429, a transfer that breaks
+    in the body.
+    """
+    # Resolved here: a client library without these classes fails where the
+    # classifier is built, not inside a request's failure arm.
+    proxy = (http.ClientProxyConnectionError, http.ClientHttpProxyError)
+    connector = http.ClientConnectorError
+    response = http.ClientResponseError
+    timeouts = (TimeoutError, asyncio.TimeoutError)
+
+    def classify(error: BaseException) -> str | None:
+        if isinstance(error, proxy):
+            return None
+        if isinstance(error, timeouts):
+            return MEDIA_FAULT_TRANSIENT
+        if isinstance(error, connector):
+            # The kernel's connect timeout arrives inside a connector error.
+            if isinstance(getattr(error, "os_error", None), timeouts):
+                return MEDIA_FAULT_TRANSIENT
+            return MEDIA_FAULT_CLIENT
+        if isinstance(error, response) and error.status >= 500:
+            return MEDIA_FAULT_TRANSIENT
+        return None
+
+    return classify
+
+
+def _no_fetch_fault(error: BaseException) -> str | None:
+    return None
 
 
 def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
@@ -289,6 +352,10 @@ class InProcessMediaProcessor:
     # The served family's short-side floor (`floor_rule`), applied to a
     # fetched image before the engine's processor sees it; None raises nothing.
     _short_side_floor: FloorRule | None = None
+    # The media-fault kind of a fetch failure (`fetch_fault_classifier`),
+    # bound at construction to the fetcher's HTTP client; this default types
+    # nothing, so every failure stays retryable.
+    _fetch_fault: Callable[[BaseException], str | None] = staticmethod(_no_fetch_fault)
 
     def __init__(
         self,
@@ -321,6 +388,16 @@ class InProcessMediaProcessor:
         self.max_inflight = max_inflight
         # The fetcher already decides which failures are the caller's.
         self._caller_error = VLLMClientError
+        # Which fetch failures name the reference's host or origin, by the
+        # exception types of the fetcher's HTTP client. Without that client,
+        # or with one that lacks the types, nothing is typed and every
+        # failure stays retryable, as before the kinds existed.
+        try:
+            import aiohttp
+
+            self._fetch_fault = fetch_fault_classifier(aiohttp)
+        except (ImportError, AttributeError) as e:
+            logger.warning("Media fetch failures are not typed and stay retryable: %s", e)
         # Same construction as vLLM's OpenAI frontend, so the engine-level
         # allowlists and media_io_kwargs apply to refs fetched here.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
@@ -390,10 +467,12 @@ class InProcessMediaProcessor:
         A bad URL or unusable media is the caller's and terminal, and so is a
         data URL in a form the fetcher does not take (one that is not base64,
         which it refuses as not implemented): no other worker takes it either.
-        A timeout, a refused connection, an origin 5xx or a loader the worker
-        lacks (whatever the reference, a base64 data URL included) is not: the
-        same request can succeed elsewhere or later, so it leaves here as
-        retryable.
+        A loader the worker lacks (whatever the reference, a base64 data URL
+        included) is not: the same request can succeed elsewhere, so it leaves
+        here as retryable. A refused connection, a name that does not resolve,
+        a timeout or an origin 5xx names the reference's host or origin: it
+        leaves as `MmMediaFetchFault`, which a servicer that reads its kind
+        reports as the media's and one that does not keeps retryable.
         """
         try:
             if item.modality == "image":
@@ -418,6 +497,11 @@ class InProcessMediaProcessor:
             ):
                 raise ValueError(f"media_refs[{index}]: {e}") from e
             logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
+            fault = self._fetch_fault(e)
+            if fault is not None:
+                # A timeout carries no words of its own.
+                words = str(e) or "timed out"
+                raise MmMediaFetchFault(fault, f"media_refs[{index}]: fetch failed: {words}") from e
             raise MmProcessorUnavailable(f"media_refs[{index}]: fetch failed: {e}") from e
         raise ValueError(f"unsupported media modality {item.modality!r}")
 

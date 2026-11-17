@@ -31,7 +31,7 @@ use engine_servicer::{
     DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
     PIXEL_MODALITIES,
 };
-use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
+use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, MediaErrorCode, Modality};
 use prost::Message;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
@@ -360,7 +360,10 @@ fn lent_bytes(owner: Bound<'_, PyAny>) -> PyResult<Bytes> {
 /// (prompt_token_ids, mm_features | None, aux_frames, cache_salt | None,
 /// media_identity | None))` where each aux frame is a read-only numpy view
 /// lent without a copy, or `(kind, message)` with `kind` one of `invalid`,
-/// `unavailable`, `internal`.
+/// `unavailable`, `internal`, or, for a fetch that failed for the reference's
+/// own reason, `media_client` or `media_transient`: the media's fault under
+/// the fetch-failed code, as the gateway's own pipeline on a worker reports
+/// it.
 #[pyclass(name = "_MediaDone")]
 struct MediaDone {
     tx: Mutex<Option<oneshot::Sender<Result<ProcessedMedia, MediaError>>>>,
@@ -368,6 +371,14 @@ struct MediaDone {
 
 #[pymethods]
 impl MediaDone {
+    /// Declares that `__call__` reads the media-fault kinds. The servicer
+    /// package sends them only to a callback that says so: one that predates
+    /// them reads a kind it does not know as `internal`.
+    #[classattr]
+    fn media_fault_kinds() -> bool {
+        true
+    }
+
     fn __call__(&self, kind: &str, payload: &Bound<'_, PyAny>) -> PyResult<()> {
         let outcome = match kind {
             "ok" => {
@@ -396,6 +407,16 @@ impl MediaDone {
             }
             "invalid" => Err(MediaError::Invalid(payload.extract()?)),
             "unavailable" => Err(MediaError::Unavailable(payload.extract()?)),
+            "media_client" => Err(MediaError::Media {
+                fault: smg_grpc_client::WorkerMediaFault::Client,
+                code: MediaErrorCode::FetchFailed.as_str(),
+                message: payload.extract()?,
+            }),
+            "media_transient" => Err(MediaError::Media {
+                fault: smg_grpc_client::WorkerMediaFault::Transient,
+                code: MediaErrorCode::FetchFailed.as_str(),
+                message: payload.extract()?,
+            }),
             _ => Err(MediaError::Internal(payload.extract()?)),
         };
         let sender = self
