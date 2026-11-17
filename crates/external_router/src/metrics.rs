@@ -493,8 +493,8 @@ pub mod handles {
         use_handle: impl FnOnce(&H),
     ) {
         // One model is the usual deployment, and comparing its name costs a
-        // fraction of hashing it with SipHash: the hash runs only once the
-        // map holds a second model.
+        // fraction of hashing it with SipHash: the hash runs only once this
+        // map keeps a second label, whatever request brought it.
         let found = if map.len() == 1 {
             map.iter()
                 .next()
