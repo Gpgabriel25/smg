@@ -385,15 +385,18 @@ mod tests {
             .expect("a grammar")
             .payload();
         assert_eq!(payload["format"]["type"], "sequence");
-        let prefix = &payload["format"]["elements"][0];
-        assert_eq!(prefix["type"], "any_text");
-        assert!(
-            prefix.get("end").is_none(),
-            "nothing owed at the prefix's end: {prefix}"
+        let lead = &payload["format"]["elements"][0];
+        assert_eq!(lead["type"], "optional");
+        let thought = &lead["content"];
+        assert_eq!(
+            thought["end"], "</think>",
+            "the thought's close is owed: {thought}"
         );
         assert_eq!(
-            prefix["excludes"],
+            thought["content"]["excludes"],
             value!([
+                "<think>",
+                "</think>",
                 "<tool_call>",
                 "</tool_call>",
                 "<function=",
@@ -403,7 +406,7 @@ mod tests {
             ])
         );
         // The table's layout writes its two newlines after the thought's close, between the
-        // prefix and the calls.
+        // thought and the calls.
         assert_eq!(
             payload["format"]["elements"][1],
             value!({"type": "const_string", "value": "\n\n"})

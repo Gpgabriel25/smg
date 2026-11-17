@@ -127,10 +127,11 @@ pub(super) fn tagged(
 /// `reasoning_open` when the prompt leaves the model inside its thought and `thought_closed` when
 /// it closed the thought itself and wrote the template's text after it, in the `vocabulary` the
 /// worker's grammar compiler takes ([`tagged`]). A registry table's tag that opens with free
-/// text, the prefix an open thought takes on workers that name no one start for the grammar
-/// ([`opens_with_free_text`]), comes marked ([`Prepared::OpensWithFreeText`]): text that owes
-/// nothing at its end does not hold the model to the call, so preparation gives the older
-/// registry's schema in the tag's place where that schema can be built ([`Prepared::held_by`]).
+/// text, the open thought it takes or leaves out on workers that name no one start for the
+/// grammar ([`opens_with_free_text`]), comes marked ([`Prepared::OpensWithFreeText`]): an
+/// engine that starts behind the thought's close reads that text as the model's own, which
+/// does not hold it to the call, so preparation gives the older registry's schema in the
+/// tag's place where that schema can be built ([`Prepared::held_by`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engine leave the model, \
@@ -184,11 +185,18 @@ fn calls_tag(
     })
 }
 
-/// Whether `grammar` opens with free text, which owes nothing at its end: a tag that begins so
-/// does not hold the model to what follows it.
+/// Whether `grammar` opens with free text: text that owes nothing at its end, or the prompt's
+/// open thought as a table's tag takes it where no one start is named, closed by its own marker
+/// or left out. An engine that starts after its reasoning parser reads that thought's text as
+/// the model's own, so a tag that begins either way does not hold the model to what follows it.
 fn opens_with_free_text(grammar: &Grammar) -> bool {
     match grammar {
         Grammar::AnyText { .. } => true,
+        Grammar::Optional(content) => matches!(
+            &**content,
+            Grammar::Tag(tag)
+                if tag.begin.is_empty() && matches!(*tag.content, Grammar::AnyText { .. })
+        ),
         Grammar::Sequence(elements) => elements.first().is_some_and(opens_with_free_text),
         _ => false,
     }
@@ -326,7 +334,7 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 /// since it generates no token a grammar constrains (the roles that do are allow-listed, so a
 /// role added later is left out until it is named); `Either` when one that starts at the first
 /// token stands beside one that does not, since no one tag fits both (the answer keeps the
-/// prefix a forced call takes: [`Format::answer_grammar_for`]); unknown when none says, and
+/// prefix of free text: [`Format::answer_grammar_for`]); unknown when none says, and
 /// when workers that start after their reasoning parser stand beside ones that do not say,
 /// since the unknown start's tags fit both (a forced call's tag, or the older registry's schema
 /// where the table's tag would open with free text; an answer's schema alone).
@@ -1485,10 +1493,12 @@ mod tests {
     /// calls when the prompt leaves the thought open: nothing after the reasoning parser's gate
     /// (a JSON answer then needs no tag; the request's own schema goes to the engine as it is),
     /// the thought closed first from the first token, the schema alone (the request's own, no
-    /// tag) when the worker does not say, and for the calls the free-text prefix, marked as
-    /// such, when the model's workers name different starts or none: free text owes the call
-    /// nothing, so preparation gives the older registry's schema in the tag's place. The
-    /// answer's tag derives for the selected worker, whatever start the pool names.
+    /// tag) when the worker does not say, and for the calls that thought or nothing of it,
+    /// marked as opening with free text, when the model's workers name different starts or
+    /// none: an engine that starts behind the close reads the thought's text as the model's own,
+    /// which owes the call nothing, so preparation gives the older registry's schema in the
+    /// tag's place. The answer's tag derives for the selected worker, whatever start the pool
+    /// names.
     #[test]
     fn the_workers_grammar_start_shapes_what_precedes_a_tables_answer_and_calls() {
         let deepseek = names(Some("deepseek_v4"), Some("deepseek_v4"));
@@ -1593,7 +1603,7 @@ mod tests {
             };
             let tag: Value = serde_json::from_str(&tag).expect("JSON");
             assert_eq!(
-                tag["format"]["elements"][0]["type"], "any_text",
+                tag["format"]["elements"][0]["type"], "optional",
                 "{start:?}: {tag}"
             );
             assert!(!first_token, "{start:?}: not built for the first token");
@@ -3187,8 +3197,8 @@ mod tests {
             Some(text.as_str())
         );
         assert_eq!(stamp.schema(), Some(&schema));
-        // The forced call's tag keeps the pool's start: the prefix that fits either kind, which
-        // is free text, so the tag comes marked.
+        // The forced call's tag keeps the pool's start: the thought or nothing of it, which fits
+        // either kind and opens with free text, so the tag comes marked.
         let forced = request(json!({"tool_choice": "required"}));
         let Ok(Prepared::OpensWithFreeText {
             constraint: ToolConstraint::StructuralTag(call),
@@ -3208,7 +3218,7 @@ mod tests {
             panic!("a forced tag, marked");
         };
         let call: Value = serde_json::from_str(&call).expect("JSON");
-        assert_eq!(call["format"]["elements"][0]["type"], "any_text", "{call}");
+        assert_eq!(call["format"]["elements"][0]["type"], "optional", "{call}");
         assert!(
             !first_token,
             "the pool's start is either: not built for the first token"

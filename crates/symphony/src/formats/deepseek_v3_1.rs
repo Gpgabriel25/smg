@@ -707,10 +707,7 @@ mod tests {
             payload(&[forecast()], forced(true, true, GrammarStart::Unknown)).expect("a tag");
         assert_eq!(
             unknown["format"]["elements"][0],
-            value!({"type": "any_text", "excludes": [
-                "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>", "<｜tool▁call▁begin｜>",
-                "<｜tool▁call▁end｜>",
-            ]})
+            value!({"type": "optional", "content": first["format"]["elements"][0].clone()})
         );
         assert_eq!(unknown["format"]["elements"][1], closed["format"]);
     }

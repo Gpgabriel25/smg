@@ -36,10 +36,10 @@
 //! may come, such a call has no tag: the free text after a tag would be the call's own, and a
 //! parameter written there would count with nothing to constrain it.
 //!
-//! With the prompt's thought open, a tag that owes a call follows the free prefix every syntax's
-//! tag takes; one that owes none takes no prefix, its own free text writing the thought: an engine
-//! reads free text before triggered tags so that the prefix could end inside the call's terminal
-//! and the triggered tags' free text write the rest, a call no tag constrains.
+//! With the prompt's thought open, a tag that owes a call follows the prefix every syntax's tag
+//! takes; one that owes none takes no prefix, its own free text writing the thought: an engine
+//! reads free text before triggered tags so that a free prefix could end inside the call's
+//! terminal and the triggered tags' free text write the rest, a call no tag constrains.
 //!
 //! Arguments that are one JSON value (Kimi K2's) are written as the tool's schema where the value
 //! stands, right after the header the layout spells and before the trailer and the close; the

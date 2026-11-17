@@ -1766,3 +1766,75 @@ fn qwen3_5s_tag_is_the_tagged_tables_where_their_layouts_agree() {
         json!({"type": "const_string", "value": "True"})
     );
 }
+
+/// The tag of a call the request owes, from a prompt that leaves the thought open, on a start no
+/// engine named: the Qwen3 table's, whose template writes two newlines between the thought's
+/// close and a call. It is the tags of the two named starts side by side, so it takes the
+/// thought with its close, or nothing of it, and no prose outside a thought.
+#[expect(
+    clippy::expect_used,
+    reason = "the registry has the table, and the table writes the tag"
+)]
+fn owed_call_on_an_unnamed_start() -> Grammar {
+    let weather = Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            })),
+            strict: None,
+            extra: Default::default(),
+        },
+    };
+    let table = symphony::formats::Table::ALL
+        .iter()
+        .find(|table| table.name() == "qwen3")
+        .expect("the Qwen3 table");
+    let tag = table
+        .format()
+        .grammar_for(
+            &[weather],
+            Options {
+                at_least_one: true,
+                reasoning_open: true,
+                thought_closed: false,
+                one_call: false,
+                start: GrammarStart::Unknown,
+            },
+        )
+        .expect("a tag");
+    tag.check().expect("a tag the engines take");
+    tag
+}
+
+/// One call as the Qwen3 template writes it.
+const OWED_CALL: &str =
+    "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+
+#[test]
+fn an_unnamed_start_takes_a_thought_its_close_and_the_owed_call() {
+    let text = format!("A thought.\n</think>\n\n{OWED_CALL}");
+    assert!(accepts(&owed_call_on_an_unnamed_start(), &text));
+}
+
+#[test]
+fn an_unnamed_start_refuses_prose_between_the_thoughts_close_and_the_owed_call() {
+    let text = format!("A thought.\n</think>\n\nProse.\n\n{OWED_CALL}");
+    assert!(!accepts(&owed_call_on_an_unnamed_start(), &text));
+}
+
+#[test]
+fn an_unnamed_start_takes_the_owed_call_at_once_behind_the_close() {
+    let text = format!("\n\n{OWED_CALL}");
+    assert!(accepts(&owed_call_on_an_unnamed_start(), &text));
+}
+
+#[test]
+fn an_unnamed_start_refuses_prose_before_the_owed_call_behind_the_close() {
+    let text = format!("Prose.\n\n{OWED_CALL}");
+    assert!(!accepts(&owed_call_on_an_unnamed_start(), &text));
+}

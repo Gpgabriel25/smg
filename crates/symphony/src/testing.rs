@@ -457,7 +457,7 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
         assert_eq!(elements[0]["end"], close, "{choice}: {first}");
         assert_eq!(elements[1], text, "{choice}: {first}");
         assert_eq!(elements[2], *calls, "{choice}: {first}");
-        // The thought open, where the engine does not say: free text that may hold the close,
+        // The thought open, where the engine does not say: that thought or nothing of it,
         // `after`, the calls.
         let unknown = tag(true, GrammarStart::Unknown);
         let elements = unknown["format"]["elements"]
@@ -465,7 +465,11 @@ pub(crate) fn a_forced_tag_begins_with_the_templates_text(
             .unwrap_or_else(|| panic!("{choice}: {unknown}"));
         assert_eq!(unknown["format"]["type"], "sequence", "{choice}: {unknown}");
         assert_eq!(elements.len(), 3, "{choice}: {unknown}");
-        assert_eq!(elements[0]["type"], "any_text", "{choice}: {unknown}");
+        assert_eq!(
+            elements[0],
+            value!({"type": "optional", "content": first["format"]["elements"][0].clone()}),
+            "{choice}: {unknown}"
+        );
         assert_eq!(elements[1], text, "{choice}: {unknown}");
         assert_eq!(elements[2], *calls, "{choice}: {unknown}");
     }
