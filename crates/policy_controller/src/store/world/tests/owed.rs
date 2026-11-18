@@ -9,8 +9,8 @@ use std::{
 };
 
 use super::{
-    ask, facts, load, member, running_of, stalled, status, view, Classes, ViewBuffers, ASKER,
-    MODEL, PUBLISH_WINDOW,
+    ask, block, facts, generation_with, load, member, overloaded, pressure, running_of, stalled,
+    status, view, Classes, ViewBuffers, ASKER, MODEL, PUBLISH_WINDOW,
 };
 use crate::{
     store::{
@@ -188,6 +188,106 @@ fn a_replaced_incarnation_leaves_at_the_answer_and_the_new_one_joins_at_the_buil
     store.publish_now();
     let (rows, _, _) = view(&store, &ask(t0));
     assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [new]);
+}
+
+#[test]
+fn a_worker_that_returns_under_its_id_inside_the_window_stays_out_of_the_pools_it_left() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let stays = member(&store, "http://a:8000");
+    let leaves = member(&store, "http://b:8000");
+    for id in [stays, leaves] {
+        status(&store, id, WorkerStatus::Ready);
+    }
+    store
+        .remove(leaves, revision(&store, leaves))
+        .expect("removed");
+    // The same key and incarnation, registered for another model: the same
+    // id, told ready before any build.
+    let back = store
+        .upsert(facts("http://b:8000", Role::Single, &["other"]))
+        .id();
+    assert_eq!(back, leaves);
+    status(&store, back, WorkerStatus::Ready);
+    // The status is the new registration's. The row of the one that left
+    // stays out of rotation in the pool it left, and the build reads the
+    // status with the registration.
+    assert_eq!(handed(&store, t0), [stays]);
+    store.publish_now();
+    assert_eq!(handed(&store, t0), [stays]);
+    let mut out = ViewBuffers::default();
+    store
+        .build_view("other", Role::Single, &ask(t0), &mut out)
+        .expect("the pool it registered for");
+    let ready = out.candidates.iter().filter(|row| row.health.routable());
+    assert_eq!(ready.map(|row| row.id).collect::<Vec<_>>(), [back]);
+}
+
+#[test]
+fn no_veto_on_a_worker_that_left_stands_over_the_one_that_returns_under_its_id() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    status(&store, id, WorkerStatus::Ready);
+    store.gateway_veto(ASKER, id, Some(t0 + Duration::from_secs(1)));
+    assert_eq!(stalled(&store, ASKER, t0), [id]);
+    store.remove(id, revision(&store, id)).expect("removed");
+    let back = store
+        .upsert(facts("http://a:8000", Role::Single, &[MODEL]))
+        .id();
+    assert_eq!(back, id);
+    status(&store, back, WorkerStatus::Ready);
+    store.publish_now();
+    // The veto left with the worker it was on, at the leave's answer: the
+    // build finds none to put on the one that returned.
+    assert_eq!(stalled(&store, ASKER, t0), []);
+    assert_eq!(handed(&store, t0), [back]);
+}
+
+#[test]
+fn the_word_that_no_report_came_leaves_with_the_worker_it_was_said_of() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(&[(id, 0, Some(pressure(9, 0)))], t0, LoadSource::Poll);
+    store.report(&[(id, 0, None)], t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0), []);
+    store.remove(id, revision(&store, id)).expect("removed");
+    let back = store
+        .upsert(facts("http://a:8000", Role::Single, &[MODEL]))
+        .id();
+    // The one that returned reports a queue past the threshold before its
+    // build. The build judges it from that record: the word said of the one
+    // that left is not carried to it.
+    store.record(back, 0, pressure(9, 0), t0, LoadSource::Stream);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0), [back]);
+}
+
+#[test]
+fn a_poll_with_no_report_for_a_worker_that_returned_moves_no_verdict_before_its_build() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(&[(id, 0, Some(pressure(9, 0)))], t0, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![id], 1)
+    );
+    store.remove(id, revision(&store, id)).expect("removed");
+    let back = store
+        .upsert(facts("http://a:8000", Role::Single, &[MODEL]))
+        .id();
+    // The poll's word is the new registration's, whose engine is not built
+    // yet: it does not reach the engine of the one that left.
+    store.report(&[(back, 0, None)], t0, LoadSource::Poll);
+    assert_eq!(store.overload_flips(), 1);
 }
 
 #[test]

@@ -523,10 +523,10 @@ fn with_veto(
 
 /// The gateways' vetoes as the writer keeps them: per gateway its vetoed
 /// workers by id, each until an instant. Replaced whole at each of the
-/// four writes that change them, all rare: a veto's write, a gateway's
-/// leaving that takes its whole list, a membership write that takes a
-/// departed worker's vetoes with its row, and a window's publication that
-/// drops a veto past its end. A world carries what is
+/// writes that change them, all rare: a veto's write, a gateway's leaving
+/// that takes its whole list, a leave, which takes the worker's vetoes with
+/// it, a membership build handed no row for a vetoed worker, and a window's
+/// publication that drops a veto past its end. A world carries what is
 /// derived from them: each pool's runs by gateway ([`PoolVetoes`]).
 #[derive(Debug, Default)]
 struct Vetoes {
@@ -574,6 +574,27 @@ impl Vetoes {
                 by_gateway.insert(*gateway, kept.into());
             }
         }
+        Some(Self { by_gateway })
+    }
+
+    /// The vetoes less every gateway's on worker `id`, when one names it: a
+    /// worker's vetoes leave with it, at its leave's answer.
+    fn without(&self, id: WorkerId) -> Option<Self> {
+        let names = |list: &Arc<[(WorkerId, Instant)]>| {
+            list.binary_search_by_key(&id, |&(worker, _)| worker)
+                .is_ok()
+        };
+        if !self.by_gateway.values().any(names) {
+            return None;
+        }
+        let mut by_gateway = self.by_gateway.clone();
+        by_gateway.retain(|_, list| {
+            if names(list) {
+                let kept = list.iter().copied().filter(|&(worker, _)| worker != id);
+                *list = kept.collect();
+            }
+            !list.is_empty()
+        });
         Some(Self { by_gateway })
     }
 
@@ -1060,9 +1081,16 @@ impl Iterator for Segments<'_> {
 struct Held {
     id: WorkerId,
     /// The revision of the member's row at the read: a write of the row's
-    /// facts moves it.
+    /// facts moves it. [`Held::LEFT`] from the member's leave.
     revision: u64,
     listed: Listed,
+}
+
+impl Held {
+    /// A revision no row stands at, a row's being the count of its facts'
+    /// writes: a member back under its id before the next build is read
+    /// again.
+    const LEFT: u64 = u64::MAX;
 }
 
 /// The candidate row of one member: its fixed fields from its registration,
@@ -1327,8 +1355,21 @@ fn encode_up(
 #[derive(Clone, Copy)]
 struct Place {
     id: WorkerId,
+    /// The pool's index, or [`Place::LEFT`] from the member's leave to the
+    /// next build.
     pool: u32,
     row: u32,
+}
+
+impl Place {
+    /// The pool of a member that left: no pool's index, so a write that
+    /// looks the member's rows up by its places finds none.
+    const LEFT: u32 = u32::MAX;
+
+    /// The member left since the last build.
+    const fn left(self) -> bool {
+        self.pool == Self::LEFT
+    }
 }
 
 /// The writer's own copy of one pool: what records and status changes are
@@ -1913,12 +1954,12 @@ impl Writer {
     }
 
     /// The engine the member is a rank of; `None` for a member with no
-    /// row.
+    /// row, and for one that left since the last build.
     pub(super) fn engine_of(&self, id: WorkerId) -> Option<u32> {
         let first = self.places.partition_point(|place| place.id < id);
         self.places
             .get(first)
-            .filter(|place| place.id == id)
+            .filter(|place| place.id == id && !place.left())
             .and_then(|_| self.engine_at(first as u32))
     }
 
@@ -2070,15 +2111,17 @@ impl Writer {
         // An engine whose last poll brought no report stays silent across
         // the write: its verdict is not raised again from what is still on
         // file. The word is carried by its members' ids, which the outgoing
-        // places hold in order. The list is empty while no engine is
-        // silent.
+        // places hold in order, and by none that left: a worker back under
+        // its id is judged from what it reported since. The list is empty
+        // while no engine is silent.
         let mut silent: Vec<WorkerId> = Vec::new();
         if self.silenced > 0 {
             let engines = &self.engines;
-            let of_silent = |&(_, &engine): &(&Place, &u32)| {
-                engines
-                    .get(engine as usize)
-                    .is_some_and(|engine| engine.silent)
+            let of_silent = |&(place, &engine): &(&Place, &u32)| {
+                !place.left()
+                    && engines
+                        .get(engine as usize)
+                        .is_some_and(|engine| engine.silent)
             };
             let outgoing = self.places.iter().zip(&self.place_engines);
             silent.extend(outgoing.filter(of_silent).map(|(place, _)| place.id));
@@ -2610,9 +2653,30 @@ impl Writer {
     /// the build its removal left owed. Published at once, as a status
     /// change is: no decision made after the removal's answer is handed the
     /// worker. `None` for a worker with no row in a pool yet.
+    ///
+    /// The leave is whole at its answer: the worker's places name no pool
+    /// until that build, and its vetoes go here. A worker that comes back
+    /// with the same key and incarnation has the same id, and a status, a
+    /// record or a veto written under it before the build is the new
+    /// registration's: it finds no row of the one that left. Its fields
+    /// under the lists are let go with it: the row that comes back may
+    /// stand at the revision they were read at and state other facts.
     #[must_use]
     pub(super) fn fold_gone(&mut self, id: WorkerId) -> Option<Arc<World>> {
-        self.fold_health(id, false, true)
+        let world = self.fold_health(id, false, true);
+        let first = self.places.partition_point(|place| place.id < id);
+        let of_member = self.places.get_mut(first..).unwrap_or_default();
+        for place in of_member.iter_mut().take_while(|place| place.id == id) {
+            place.pool = Place::LEFT;
+        }
+        if let Some(vetoes) = self.vetoes.without(id) {
+            self.vetoes = Arc::new(vetoes);
+        }
+        let held = self.listed.binary_search_by_key(&id, |held| held.id);
+        if let Some(held) = held.ok().and_then(|at| self.listed.get_mut(at)) {
+            held.revision = Held::LEFT;
+        }
+        world
     }
 
     /// Write the two status bits on each of the member's rows and publish at
