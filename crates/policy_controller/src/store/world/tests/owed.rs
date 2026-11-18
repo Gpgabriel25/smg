@@ -162,8 +162,13 @@ fn a_leave_is_in_force_at_its_answer_and_its_row_leaves_at_the_build() {
         .expect("removed");
     // No build was paid. The pool still lists the row and no decision is
     // handed it: a leave does not wait for the window.
-    assert_eq!(view(&store, &ask(t0)).0.len(), 2);
+    let (rows, _, _) = view(&store, &ask(t0));
+    assert_eq!(rows.len(), 2);
     assert_eq!(handed(&store, t0), [stays]);
+    // The row that left reads not ready and draining, both: a pass that
+    // reads one of the two bits alone still steps over it.
+    let left = rows.iter().find(|row| row.id == leaves).expect("its row");
+    assert_eq!((left.health.healthy, left.health.draining), (false, true));
     store.publish_now();
     assert_eq!(view(&store, &ask(t0)).0.len(), 1);
 }
@@ -398,4 +403,19 @@ fn the_writes_one_build_pays_ask_the_pair_classes_once() {
     assert_eq!(written(Some(a), None).then(joins), Classes::Derive);
     assert_eq!(Classes::Derive.then(Classes::Carry), Classes::Derive);
     assert_eq!(Classes::Derive.then(joins), Classes::Derive);
+}
+
+/// The contract names the window by its figure, for a caller that reads no
+/// source: the sentence and the store's constant move together.
+#[test]
+fn the_contract_names_the_window_a_registration_is_in_force_within() {
+    const CONTRACT: &str = include_str!("../../../../contracts/policy_controller.proto");
+    let figure = format!(
+        "publication window ({} ms) of their answer",
+        PUBLISH_WINDOW.as_millis()
+    );
+    assert!(
+        CONTRACT.contains(&figure),
+        "the contract does not say: {figure}"
+    );
 }
