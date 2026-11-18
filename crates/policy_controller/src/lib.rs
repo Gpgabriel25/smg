@@ -96,6 +96,7 @@ pub mod catalog;
 pub mod client;
 #[cfg(feature = "controller")]
 pub mod controller;
+pub mod counts;
 pub mod decision;
 pub mod elector;
 pub mod framework;
@@ -119,6 +120,7 @@ pub mod wasm;
 pub mod wit;
 
 pub use catalog::{Catalog, CatalogError, StageKind};
+pub use counts::{KeptCounts, LentCounts};
 pub use decision::{
     Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
     MAX_TARGETS, TRACE_TOP,

@@ -4,15 +4,15 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    identity, identity_of,
-    leases::{Counts, Slot},
-    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink, KvEvent,
-    KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
-    MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, Reachability, ReservationKind,
-    ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals, SnapshotChunk,
-    StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+    identity, identity_of, Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId,
+    HealthSink, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink,
+    LoadSource, MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, Reachability,
+    ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals,
+    SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
+    WorkersStore,
 };
 use crate::{
+    counts::{Counts, Slot},
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
     view::{fingerprint, LoadRow, Role, SignalSource, WorkerId},
 };
@@ -1461,7 +1461,24 @@ fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)
         }
     });
     let rows = out.candidates.iter();
-    rows.map(|row| (row.id, row.in_flight)).collect()
+    let written: Vec<(WorkerId, u32)> = rows.map(|row| (row.id, row.in_flight)).collect();
+    // The store's view reads the same counts: beside the rows it lends,
+    // each at its row's position, and in the rows it writes.
+    let mut viewed = ViewBuffers::default();
+    let read: Vec<(WorkerId, u32)> = store.deciding(|world| {
+        let view = world.view("m", Role::Single, &ask, false, &mut viewed);
+        view.map_or_else(Vec::new, |view| {
+            let rows = view.candidates.iter();
+            let lent = view.in_flight;
+            rows.map(|row| {
+                let own = row.in_flight;
+                (row.id, lent.map_or(own, |lent| lent.at(row.position)))
+            })
+            .collect()
+        })
+    });
+    assert_eq!(read, written, "the view's counts are the door's");
+    written
 }
 
 /// [`in_flight_for`] the gateway the cases issue their leases to.
