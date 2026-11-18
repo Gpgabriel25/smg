@@ -155,7 +155,8 @@ impl RoutingPool {
         }
     }
 
-    fn matches(self, worker: &Arc<dyn Worker>) -> bool {
+    /// Share pool membership rules with readiness without changing selection semantics.
+    pub(crate) fn matches(self, worker: &Arc<dyn Worker>) -> bool {
         match self {
             Self::HttpRegular => {
                 *worker.worker_type() == WorkerType::Regular

@@ -967,6 +967,19 @@ fn apply_connect_signal(
         debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a worker being removed; ignoring");
         return None;
     }
+    // Prepared-input generations can change across a short transport outage
+    // while health still says Ready. The recovery signal must refresh labels
+    // even though it does not promote the worker. Keep revision fencing.
+    if worker.status() == WorkerStatus::Ready
+        && worker.revision() == revision
+        && worker
+            .metadata()
+            .spec
+            .labels
+            .contains_key("sglang_prepared")
+    {
+        return Some((worker_id, worker));
+    }
     if matches!(slot, ProbeSlot::Probe(_)) && *worker.connection_mode() != ConnectionMode::Zmq {
         if worker.revision() != revision {
             debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a replaced worker; ignoring");

@@ -1400,6 +1400,31 @@ fn apply_connect_signal_reschedules_a_promoted_worker() {
 /// service (the label refresh): the worker it moved, and nothing when the
 /// signal moved nothing (already Ready, or an unknown URL).
 #[test]
+fn ready_prepared_instance_recovery_requests_label_refresh() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://encoder:8000")
+            .label("sglang_prepared", "instance-bound")
+            .build(),
+    );
+    worker.set_status(WorkerStatus::Ready);
+    let revision = worker.revision();
+    registry.register(worker.clone()).unwrap();
+    let mut next_check = HashMap::new();
+    assert!(apply_connect_signal(
+        &registry,
+        WorkerConnected {
+            url: worker.url().to_string(),
+            revision
+        },
+        &mut next_check,
+        &test_config(),
+    )
+    .is_some());
+    assert_eq!(worker.status(), WorkerStatus::Ready);
+}
+
+#[test]
 fn apply_connect_signal_reports_the_promoted_worker() {
     let registry = Arc::new(WorkerRegistry::new());
     let worker = unprobed_worker("http://w:1");

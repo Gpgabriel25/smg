@@ -722,6 +722,17 @@ pub(crate) struct ConfigValidator;
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
+        if config.is_sglang_epd()
+            && (config.enable_igw
+                || config.connection_mode != ConnectionMode::Grpc
+                || !matches!(&config.mode, RoutingMode::EncodePrefillDecode { .. }))
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason:
+                    "SGLang prepared-input EPD requires gRPC E/P/D routing and does not support IGW"
+                        .into(),
+            });
+        }
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_routing_key_headers(config)?;

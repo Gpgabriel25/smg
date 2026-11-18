@@ -91,6 +91,15 @@ impl GrpcRouter {
     /// require the MCP orchestrator; EPD leaves them `None` and 501s those
     /// endpoints. Embedding/classify pipelines are Regular-only.
     pub fn new(ctx: &Arc<AppContext>, mode: Mode) -> Result<Self, String> {
+        Self::with_prepared_input(ctx, mode, None)
+    }
+
+    /// Attach SGLang's input handoff to the same routing and response pipelines.
+    pub(crate) fn with_prepared_input(
+        ctx: &Arc<AppContext>,
+        mode: Mode,
+        prepared_input: Option<Arc<super::sglang_epd::router::PreparedInputAdapter>>,
+    ) -> Result<Self, String> {
         // Get tokenizer registry (no longer requires pre-loaded tokenizer)
         let tokenizer_registry = ctx.tokenizer_registry.clone();
 
@@ -180,7 +189,8 @@ impl GrpcRouter {
             queue_timeout,
         )
         .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky);
+        .with_grouped_dp_sticky(grouped_dp_sticky)
+        .with_prepared_input(prepared_input.clone());
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
         let pair_deps = PipelineDeps::pair(
@@ -191,7 +201,8 @@ impl GrpcRouter {
             queue_timeout,
         )
         .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky);
+        .with_grouped_dp_sticky(grouped_dp_sticky)
+        .with_prepared_input(prepared_input.clone());
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)

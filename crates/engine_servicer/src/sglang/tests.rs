@@ -1443,6 +1443,270 @@ async fn non_streaming_generate_delivers_only_the_complete() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Shared prepared D identity for quarantine tests; no native scheduler is bypassed.
+fn quarantine_decode_config() -> ManagedConfig {
+    use crate::managed::{ManagedConfig, ManagedContract};
+    ManagedConfig {
+        worker_id: "decode-test".into(),
+        generation: "instance-1".into(),
+        role: "decode".into(),
+        metadata_endpoint: None,
+        max_records: 16,
+        max_work: 4,
+        max_context_bytes: 64 * 1024 * 1024,
+        retention_ms: 1000,
+        max_duration_ms: 60_000,
+        max_clock_error_ms: 1000,
+        contract: ManagedContract {
+            model_revision: "weights".into(),
+            processor_contract: "qwen3".into(),
+            embedding_dtype: "bfloat16".into(),
+            kv_backend: "mooncake".into(),
+            embedding_backend: "mooncake".into(),
+            topology_contract: "tp1".into(),
+            bootstrap_host: "127.0.0.1".into(),
+            bootstrap_port: 8998,
+            tp_size: 1,
+        },
+    }
+}
+
+/// The same quarantine flag used by unconfirmed native cancellation also
+/// closes ordinary text admission, before a scheduler request is registered.
+#[tokio::test]
+async fn quarantined_prepared_runtime_refuses_ordinary_text_before_registration() {
+    use smg_grpc_client::sglang_managed::Limits;
+    use zeromq::{PushSocket, Socket, SocketSend};
+
+    use crate::managed::native::ManagedNativeRuntime;
+
+    async fn text_round_trip(h: &mut Harness, rid: &str) {
+        let mut stream = h
+            .client
+            .generate(generate_request(rid, false, Vec::new()))
+            .await
+            .expect("ordinary text admitted")
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.rid, rid);
+        send(
+            &mut h.engine_out,
+            &batch(rid, vec![7], 1, Some("stop"), None),
+        )
+        .await;
+        assert_eq!(
+            complete(stream.message().bounded().await.unwrap().unwrap()).output_ids,
+            vec![7]
+        );
+        assert!(stream.message().bounded().await.unwrap().is_none());
+        wait_until(|| h.server.state.shared.registry.active() == 0).await;
+    }
+
+    let mut h = harness(model_info()).await;
+    text_round_trip(&mut h, "ordinary-without-prepared").await;
+
+    // Install the real prepared runtime on the RPC harness. Ordinary text has
+    // the same Generate path in both launch modes; no private control is sent.
+    let config = quarantine_decode_config();
+    let client = h.server.state.shared.engine().unwrap().clone();
+    let runtime = Arc::new(
+        ManagedNativeRuntime::new(
+            Arc::new(move || Some(client.clone())),
+            &config,
+            Limits::default(),
+        )
+        .unwrap(),
+    );
+    assert!(h.server.state.prepared.set(Arc::clone(&runtime)).is_ok());
+    assert!(runtime.ready());
+    text_round_trip(&mut h, "ordinary-prepared-ready").await;
+
+    // Exercise the actual metadata-reader failure path, which sets the same
+    // quarantine flag as the cancellation-grace expiry. No test-only flag setter.
+    let endpoint = format!("ipc://{}", h._dir.path().join("quarantine.ipc").display());
+    let receiver = ManagedNativeRuntime::bind_metadata(&endpoint)
+        .await
+        .unwrap();
+    let mut sender = PushSocket::new();
+    sender.connect(&endpoint).await.unwrap();
+    let (failed, ()) = tokio::join!(runtime.read_metadata(receiver), async {
+        sender
+            .send("one invalid metadata frame".into())
+            .await
+            .unwrap();
+    });
+    assert_eq!(failed.unwrap_err().code(), Code::DataLoss);
+    assert!(!runtime.ready());
+    assert!(
+        h.server.state.shared.engine().unwrap().is_alive(),
+        "link stays live"
+    );
+
+    let refused = h
+        .client
+        .generate(generate_request("ordinary-quarantined", false, Vec::new()))
+        .await
+        .expect_err("quarantine must fence ordinary text at the RPC boundary");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(h.server.state.shared.registry.active(), 0);
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A silent D closes its observer after cancellation grace, but only a real native
+/// terminal can release its registration. Health and text RPCs honor quarantine.
+#[tokio::test]
+async fn prepared_decode_cancel_grace_quarantines_without_releasing_native_owner() {
+    use engine_zmq_client::protocol::handshake::ManagedSglangHandshake;
+    use smg_grpc_client::sglang_managed::{budget::Deadline, proto, LAYOUT};
+
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let server = SglangServicerServer::start_managed(
+        config(dir.path(), &handshake, model_info()),
+        quarantine_decode_config(),
+    )
+    .unwrap();
+    let mut ready = default_ready_response();
+    ready.sglang_managed = Some(ManagedSglangHandshake {
+        version: 1,
+        worker_id: "decode-test".into(),
+        generation: "instance-1".into(),
+        role: "decode".into(),
+        layout: LAYOUT.into(),
+    });
+    let engine = connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready)
+        .await
+        .unwrap();
+    let (mut engine_in, mut engine_out) = engine.split();
+    wait_until(|| server.engine_ready()).await;
+    let mut client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
+    let runtime = server.state.prepared.get().unwrap();
+    let rid = "silent-prepared-decode";
+    let operation = proto::OperationRef {
+        identity: Some(proto::Identity {
+            logical_request_id: "request".into(),
+            attempt_id: "attempt".into(),
+            branch_id: 0,
+        }),
+        target: Some(proto::Instance {
+            worker_id: "decode-test".into(),
+            generation: "instance-1".into(),
+        }),
+        operation_id: rid.into(),
+        request_digest: vec![1; 32],
+        plan_digest: vec![2; 32],
+    };
+    let binding = proto::InputBinding {
+        decode: Some(operation.clone()),
+        prefill: Some(proto::Instance {
+            worker_id: "p".into(),
+            generation: "p-generation".into(),
+        }),
+        prefill_rid: "attempt-p".into(),
+        bootstrap: Some(proto::Bootstrap {
+            host: "127.0.0.1".into(),
+            port: 8998,
+            room: 17,
+        }),
+        layout_contract: LAYOUT.into(),
+        processor_contract: "qwen3".into(),
+        model_revision: "weights".into(),
+        ..Default::default()
+    };
+    let deadline = Deadline::admit(
+        &proto::Budget {
+            original_expiry_unix_ms: 61000,
+            remaining_timeout_ms: 60000,
+            ..Default::default()
+        },
+        1000,
+        Instant::now(),
+        0,
+        0,
+        60000,
+    )
+    .unwrap();
+    let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
+    // Exercise the native owner below manifest validation, then verify the public
+    // HealthCheck and ordinary Generate RPCs against the resulting quarantine.
+    let mut output = runtime
+        .submit(
+            operation,
+            binding,
+            generate_request(rid, true, Vec::new()),
+            None,
+            None,
+            deadline,
+            registration,
+            cancellation,
+        )
+        .unwrap();
+    assert_eq!(recv_add(&mut engine_in).bounded().await.rid, rid);
+    assert_eq!(
+        server.state.shared.registry.abort(&[rid.into()]).unwrap(),
+        1
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), output.next())
+            .await
+            .is_err()
+    );
+    assert_scheduler_idle(&mut engine_in).await;
+    assert!(runtime.ready());
+    assert_eq!(server.state.shared.registry.active(), 1);
+    // Keep transport liveness independent of this request's absent KV/output.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+    let verdict = tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            tokio::select! {
+                item = output.next() => break item,
+                _ = heartbeat.tick() => send(&mut engine_out, &health_signal()).await,
+                frame = engine_in.recv_frames() => panic!("D aborted before handoff: {frame:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(verdict.code(), Code::Unavailable);
+    assert!(verdict.message().contains("worker quarantined"));
+    assert!(output.next().bounded().await.is_none());
+    assert!(!runtime.ready());
+    assert!(server.state.shared.engine().unwrap().is_alive());
+    assert_eq!(server.state.shared.registry.active(), 1);
+    assert!(
+        !client
+            .health_check(sg::HealthCheckRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .healthy
+    );
+    let refused = client
+        .generate(generate_request("text-after-grace", false, Vec::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(server.state.shared.registry.active(), 1);
+    assert_scheduler_idle(&mut engine_in).await;
+    // First native output proves handoff progressed; only now may D send Abort.
+    send(&mut engine_out, &batch(rid, vec![7], 1, None, None)).await;
+    assert_eq!(recv_abort(&mut engine_in).bounded().await, vec![rid]);
+    assert_eq!(server.state.shared.registry.active(), 1);
+    send(
+        &mut engine_out,
+        &batch(rid, vec![8], 2, Some("abort"), None),
+    )
+    .await;
+    wait_until(|| server.state.shared.registry.active() == 0).await;
+    assert!(
+        !runtime.ready(),
+        "a late receipt does not clear instance quarantine"
+    );
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
 /// String stops ride the request to the scheduler, which keeps its tokenizer
 /// and reports the matched string back.
 #[tokio::test]
