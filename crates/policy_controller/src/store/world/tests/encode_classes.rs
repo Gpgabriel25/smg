@@ -46,6 +46,7 @@ fn the_world_holds_a_models_encode_classes_by_the_rows_of_its_pools() {
     let p2 = upsert("grpc://p2:9000", Role::Prefill, "c2");
 
     // Each side stands in the classes as the rows of its pool.
+    store.publish_now();
     let (encoders, _, _) = side(&store, Role::Encode, &ask(now));
     let (prefills, _, _) = side(&store, Role::Prefill, &ask(now));
     let world = store.world();
@@ -85,6 +86,7 @@ fn a_blank_connector_of_an_encode_offer_is_dropped_at_the_door() {
     let p1 = upsert("grpc://p1:9000", Role::Prefill, "c1 ");
 
     // The names between blanks are one end; the blank one states none.
+    store.publish_now();
     let (encoders, _, _) = side(&store, Role::Encode, &ask(now));
     let (prefills, _, _) = side(&store, Role::Prefill, &ask(now));
     let world = store.world();
@@ -107,8 +109,10 @@ fn a_blank_connector_of_an_encode_offer_is_dropped_at_the_door() {
 fn a_model_with_no_encoder_or_no_prefill_has_no_encode_classes() {
     let store = MemoryStore::new();
     store.upsert(encode_facts("grpc://e1:9000", Role::Encode, push_on("c1")));
+    store.publish_now();
     assert!(store.world().encodes(MODEL).is_none());
     store.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    store.publish_now();
     let world = store.world();
     assert_eq!(
         world.encodes(MODEL).map(|classes| classes.classes()),
@@ -119,6 +123,7 @@ fn a_model_with_no_encoder_or_no_prefill_has_no_encode_classes() {
     // A model of prefills alone has none either.
     let alone = MemoryStore::new();
     alone.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    alone.publish_now();
     assert!(alone.world().encodes(MODEL).is_none());
 }
 
@@ -128,9 +133,11 @@ fn a_model_whose_encoders_state_no_end_has_no_encode_classes() {
     let silent = EncodeOffer::default();
     store.upsert(encode_facts("grpc://e1:9000", Role::Encode, silent));
     store.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    store.publish_now();
     assert!(store.world().encodes(MODEL).is_none());
     // The first encoder to state an end makes the first class.
     store.upsert(encode_facts("grpc://e2:9000", Role::Encode, push_on("c1")));
+    store.publish_now();
     let world = store.world();
     let classes = world.encodes(MODEL).expect("an end and a prefill");
     assert_eq!((classes.classes(), classes.list(1).len()), (1, 1));
@@ -152,6 +159,8 @@ fn two_stores_of_one_membership_number_the_encode_classes_alike() {
     for &(key, role, connector) in fleet.iter().rev() {
         backward.upsert(encode_facts(key, role, push_on(connector)));
     }
+    forward.publish_now();
+    backward.publish_now();
     let (ours, theirs) = (forward.world(), backward.world());
     let classes = ours.encodes(MODEL).expect("an end and a prefill");
     assert_eq!(Some(classes), theirs.encodes(MODEL));
@@ -182,6 +191,7 @@ fn two_engine_kinds_of_one_form_are_two_encode_classes_in_the_world() {
     let e2 = of_kind("grpc://e2:9000", Role::Encode, "rt-b");
     let p1 = of_kind("grpc://p1:9000", Role::Prefill, "rt-a");
     let p2 = of_kind("grpc://p2:9000", Role::Prefill, "rt-b");
+    store.publish_now();
     let (encoders, _, _) = side(&store, Role::Encode, &ask(now));
     let (prefills, _, _) = side(&store, Role::Prefill, &ask(now));
     let world = store.world();
@@ -204,9 +214,11 @@ fn a_membership_write_that_moves_no_offer_carries_the_encode_classes() {
     // The world is kept, so its classes stand where they are: one address
     // in a later world is those classes carried, never others in their
     // place.
+    store.publish_now();
     let before = store.world();
     let derived = before.encodes(MODEL).expect("the model's classes");
     let carried = |what: &str| {
+        store.publish_now();
         let world = store.world();
         let encodes = world.encodes(MODEL).expect("the model's classes");
         assert!(std::ptr::eq(derived, encodes), "{what}: derived again");
@@ -270,6 +282,7 @@ fn a_membership_write_that_moves_an_end_derives_the_encode_classes_again() {
         let store = MemoryStore::new();
         store.upsert(first());
         rest(&store);
+        store.publish_now();
         let before = store.world();
         store.upsert(facts.clone());
         // A store that never held the first version: every write of it
@@ -277,6 +290,8 @@ fn a_membership_write_that_moves_an_end_derives_the_encode_classes_again() {
         let fresh = MemoryStore::new();
         fresh.upsert(facts);
         rest(&fresh);
+        store.publish_now();
+        fresh.publish_now();
         let (after, fresh) = (store.world(), fresh.world());
         assert_eq!(after.encodes(MODEL), fresh.encodes(MODEL), "{what}");
         assert_ne!(

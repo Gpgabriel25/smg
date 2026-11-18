@@ -91,7 +91,7 @@ pub use kv_events::{
     SnapshotChunk,
 };
 pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
-pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
+pub use loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake};
 pub use memory::{Cut, MemoryStore};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};

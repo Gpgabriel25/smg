@@ -91,6 +91,7 @@ fn ready(
             ..WorkerFacts::default()
         })
         .id();
+    store.publish_now();
     let revision = store.get(id)?.revision;
     store.set_status(id, WorkerStatus::Ready, revision);
     Some(id)

@@ -953,6 +953,7 @@ pub(crate) mod tests {
             ..WorkerFacts::default()
         };
         let id = store.upsert(facts).id();
+        store.publish_now();
         let row = WorkersStore::get(store, id).expect("the row");
         if row.status != WorkerStatus::Ready {
             store
