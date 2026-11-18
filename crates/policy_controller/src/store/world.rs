@@ -1402,6 +1402,10 @@ struct EngineRows {
     /// report. It outlives a membership build, which judges again, and it
     /// is kept and ended while no threshold stands.
     silent: bool,
+    /// When the poll of that word began, in microseconds from the origin;
+    /// read while `silent` alone. A membership build carries the word over
+    /// no record that a member new to its rows brought at or after it.
+    said: u64,
 }
 
 /// One row of an engine: a rank's row in one pool, where a verdict is
@@ -2061,15 +2065,19 @@ impl Writer {
         })
     }
 
-    /// The word that no report came for the engine: from here its verdict
-    /// reads clear until its next record or report, and the engine is
-    /// judged once. The word is kept for an engine with no threshold too,
-    /// which is not judged. Whether a verdict moved.
-    pub(super) fn silence(&mut self, engine: u32) -> bool {
+    /// The word that no report came for the engine, by a poll that began at
+    /// `polled_at`: from here its verdict reads clear until its next record
+    /// or report, and the engine is judged once. The word keeps that
+    /// instant for the next membership build ([`Self::rebuild`]). It is kept
+    /// for an engine with no threshold too, which is not judged. Whether a
+    /// verdict moved.
+    pub(super) fn silence(&mut self, engine: u32, polled_at: Instant) -> bool {
+        let said = micros(self.origin, polled_at);
         let Some(rows) = self.engines.get_mut(engine as usize) else {
             return false;
         };
         let was = mem::replace(&mut rows.silent, true);
+        rows.said = said;
         self.silenced += u32::from(!was);
         self.judged(engine, false)
     }
@@ -2112,25 +2120,28 @@ impl Writer {
         // the write: its verdict is not raised again from what is still on
         // file. The word is carried by its members' ids, which the outgoing
         // places hold in order, and by none that left: a worker back under
-        // its id is judged from what it reported since. The list is empty
+        // its id is judged from what it reported since. Each id stands with
+        // the instant its engine's word was said for. The list is empty
         // while no engine is silent.
-        let mut silent: Vec<WorkerId> = Vec::new();
+        let mut silent: Vec<(WorkerId, u64)> = Vec::new();
         if self.silenced > 0 {
             let engines = &self.engines;
-            let of_silent = |&(place, &engine): &(&Place, &u32)| {
-                !place.left()
-                    && engines
-                        .get(engine as usize)
-                        .is_some_and(|engine| engine.silent)
+            let word = |(place, &engine): (&Place, &u32)| {
+                let rows = engines.get(engine as usize)?;
+                (rows.silent && !place.left()).then_some((place.id, rows.said))
             };
             let outgoing = self.places.iter().zip(&self.place_engines);
-            silent.extend(outgoing.filter(of_silent).map(|(place, _)| place.id));
+            silent.extend(outgoing.filter_map(word));
             silent.dedup();
         }
         // The ranks of the data-parallel engines, each with its engine's
         // group by key and the receipt of its sample on file. A fleet of
         // single-rank workers lists none.
         let mut by_key: FxHashMap<&'a str, u32> = FxHashMap::default();
+        // The records on file of the ranks new to the rows since the last
+        // build, each under its engine's group and by its receipt: read
+        // while a word may be carried.
+        let mut fresh: Vec<(u32, u64)> = Vec::new();
         let mut ranked: Vec<(WorkerId, u32, u64)> = Vec::new();
         // A member names a threshold of its own.
         let mut owned = false;
@@ -2172,6 +2183,13 @@ impl Writer {
                 let group = *by_key.entry(facts.engine.as_str()).or_insert(next);
                 let heard = sample.map_or(0, |sample| micros(origin, sample.received_at));
                 ranked.push((member.id, group, heard));
+                if !silent.is_empty() && sample.is_some() {
+                    let first = self.places.partition_point(|place| place.id < member.id);
+                    let stood = |place: &&Place| place.id == member.id && !place.left();
+                    if self.places.get(first).filter(stood).is_none() {
+                        fresh.push((group, heard));
+                    }
+                }
             }
             owned |= facts.overload != Overload::default();
             let listed = if listing {
@@ -2342,7 +2360,25 @@ impl Writer {
         self.engine_rows.clear();
         self.place_engines.clear();
         self.place_slots.clear();
-        let carries = !silent.is_empty();
+        // A member new to the rows reported for its engine all the same, and
+        // no write before this build knew that engine: the word is carried
+        // to the engine over no record of such a member that came at or
+        // after the word's poll began, in that poll's answer or since.
+        if !fresh.is_empty() {
+            silent.retain(|&(id, said)| {
+                let at = ranked.binary_search_by_key(&id, |&(of, ..)| of).ok();
+                let group = at.and_then(|at| ranked.get(at)).map(|&(_, group, _)| group);
+                !fresh
+                    .iter()
+                    .any(|&(of, received)| Some(of) == group && received >= said)
+            });
+        }
+        // The word a member's engine takes from it: the instant it was said
+        // for.
+        let carried = |id: WorkerId| {
+            let at = silent.binary_search_by_key(&id, |&(of, _)| of).ok()?;
+            silent.get(at).map(|&(_, said)| said)
+        };
         let mut silenced = 0;
         let mut last = None;
         if ranked.is_empty() {
@@ -2354,13 +2390,14 @@ impl Writer {
                 let rank = last != Some(place.id);
                 if rank {
                     last = Some(place.id);
-                    let carried = carries && silent.binary_search(&place.id).is_ok();
-                    silenced += u32::from(carried);
+                    let said = carried(place.id);
+                    silenced += u32::from(said.is_some());
                     engines.push(EngineRows {
                         at: self.engine_rows.len() as u32,
                         len: 0,
                         judged: false,
-                        silent: carried,
+                        silent: said.is_some(),
+                        said: said.unwrap_or_default(),
                     });
                 }
                 if let Some(engine) = engines.last_mut() {
@@ -2403,9 +2440,11 @@ impl Writer {
                         }
                     };
                     if let Some(rows) = engines.get_mut(engine as usize) {
-                        let carried = carries && silent.binary_search(&place.id).is_ok();
-                        silenced += u32::from(carried && !rows.silent);
-                        rows.silent |= carried;
+                        if let Some(said) = carried(place.id) {
+                            silenced += u32::from(!rows.silent);
+                            rows.silent = true;
+                            rows.said = rows.said.max(said);
+                        }
                     }
                 }
                 if let Some(rows) = engines.get_mut(engine as usize) {

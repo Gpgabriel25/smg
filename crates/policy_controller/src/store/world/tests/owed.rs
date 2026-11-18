@@ -9,8 +9,8 @@ use std::{
 };
 
 use super::{
-    ask, block, facts, generation_with, load, member, overloaded, pressure, running_of, stalled,
-    status, view, Classes, ViewBuffers, ASKER, MODEL, PUBLISH_WINDOW,
+    ask, block, facts, generation_with, load, member, overloaded, pressure, rank_of, running_of,
+    stalled, status, view, Classes, ViewBuffers, ASKER, MODEL, PUBLISH_WINDOW,
 };
 use crate::{
     store::{
@@ -229,6 +229,41 @@ fn a_worker_that_returns_under_its_id_inside_the_window_stays_out_of_the_pools_i
 }
 
 #[test]
+fn a_worker_of_two_pools_that_returns_under_its_id_stays_out_of_both() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let stays = member(&store, "http://a:8000");
+    let two = || {
+        let models = [MODEL, "other"];
+        let facts = facts("http://b:8000", Role::Single, &models);
+        store.upsert(facts).id()
+    };
+    let both = two();
+    store.publish_now();
+    for id in [stays, both] {
+        status(&store, id, WorkerStatus::Ready);
+    }
+    let other = || {
+        let mut out = ViewBuffers::default();
+        store
+            .build_view("other", Role::Single, &ask(t0), &mut out)
+            .expect("the other pool");
+        let ready = out.candidates.iter().filter(|row| row.health.routable());
+        ready.map(|row| row.id).collect::<Vec<_>>()
+    };
+    assert_eq!((handed(&store, t0).len(), other()), (2, vec![both]));
+    store.remove(both, revision(&store, both)).expect("removed");
+    let back = two();
+    assert_eq!(back, both);
+    status(&store, back, WorkerStatus::Ready);
+    // The leave took every place of the worker: the status is the new
+    // registration's in each pool, and neither hands it before the build.
+    assert_eq!((handed(&store, t0), other()), (vec![stays], vec![]));
+    store.publish_now();
+    assert_eq!((handed(&store, t0).len(), other()), (2, vec![back]));
+}
+
+#[test]
 fn no_veto_on_a_worker_that_left_stands_over_the_one_that_returns_under_its_id() {
     let store = MemoryStore::new();
     let t0 = Instant::now();
@@ -293,6 +328,235 @@ fn a_poll_with_no_report_for_a_worker_that_returned_moves_no_verdict_before_its_
     // yet: it does not reach the engine of the one that left.
     store.report(&[(back, 0, None)], t0, LoadSource::Poll);
     assert_eq!(store.overload_flips(), 1);
+}
+
+/// A rank of the two-rank engine, as its registration names it.
+fn rank_facts(rank: u16) -> WorkerFacts {
+    WorkerFacts {
+        engine: "http://e:8000".to_string(),
+        dp_rank: rank,
+        dp_size: 2,
+        ..facts(&format!("http://e:8000#{rank}"), Role::Single, &[MODEL])
+    }
+}
+
+/// The two ranks of one engine, under a block of eight waiting requests.
+fn two_ranks(store: &MemoryStore) -> [WorkerId; 2] {
+    let ranks = [0, 1].map(|rank| rank_of(store, "http://e:8000", rank));
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    ranks
+}
+
+/// Rank 0 leaves and registers again under its key, with no build between:
+/// the same id.
+fn returns(store: &MemoryStore, id: WorkerId) -> WorkerId {
+    store.remove(id, revision(store, id)).expect("removed");
+    let back = store.upsert(rank_facts(0)).id();
+    assert_eq!(back, id);
+    back
+}
+
+/// Rank 0 registers again as a new life under its key, with no build:
+/// another id.
+fn restarts(store: &MemoryStore, id: WorkerId) -> WorkerId {
+    let life = WorkerFacts {
+        incarnation: 2,
+        ..rank_facts(0)
+    };
+    let new = store.upsert(life).id();
+    assert_ne!(new, id);
+    new
+}
+
+/// One rank past the threshold and no row for the other, with both ranks
+/// standing and then with rank 0 inside the window `change` opens.
+fn partial_poll_after(change: fn(&MemoryStore, WorkerId) -> WorkerId) {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let [a, b] = two_ranks(&store);
+    let partial = [(a, 0, Some(pressure(9, 0))), (b, 1, None)];
+    store.report(&partial, t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0).len(), 2);
+    let calm = [(a, 0, Some(pressure(0, 0))), (b, 1, Some(pressure(0, 0)))];
+    store.report(&calm, t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0), []);
+    let again = change(&store, a);
+    // The same poll before the build. No row takes the rank's sample, and
+    // the word that no report came is said of the rank that stands. The
+    // build knows the engine of the rank new to its rows: it carries no
+    // word over a row the word's own poll brought, and judges the engine.
+    let partial = [(again, 0, Some(pressure(9, 0))), (b, 1, None)];
+    store.report(&partial, t0, LoadSource::Poll);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0).len(), 2);
+}
+
+#[test]
+fn the_build_carries_no_word_over_the_row_a_poll_brought_a_returned_rank() {
+    partial_poll_after(returns);
+}
+
+#[test]
+fn the_build_carries_no_word_over_the_row_a_poll_brought_a_restarted_rank() {
+    partial_poll_after(restarts);
+}
+
+#[test]
+fn the_build_carries_no_word_over_the_row_a_poll_brought_a_rank_new_to_its_engine() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = rank_of(&store, "http://e:8000", 0);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    // The second rank registers after the first was built, and the poll's
+    // answer comes inside its window.
+    let b = store.upsert(rank_facts(1)).id();
+    let partial = [(a, 0, None), (b, 1, Some(pressure(9, 0)))];
+    store.report(&partial, t0, LoadSource::Poll);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0).len(), 2);
+}
+
+/// The engine's word that no report came stands, with a record past the
+/// threshold still on file for rank 1.
+fn silent_engine(store: &MemoryStore, t0: Instant) -> [WorkerId; 2] {
+    let [a, b] = two_ranks(store);
+    let loaded = [(a, 0, Some(pressure(0, 0))), (b, 1, Some(pressure(9, 0)))];
+    store.report(&loaded, t0, LoadSource::Poll);
+    assert_eq!(overloaded(store, t0).len(), 2);
+    store.report(&[(a, 0, None), (b, 1, None)], t0, LoadSource::Poll);
+    assert_eq!(overloaded(store, t0), []);
+    [a, b]
+}
+
+/// A record from rank 0 inside the window `change` opens, under its
+/// engine's standing word: the build carries no word over it.
+fn record_under_a_word_after(change: fn(&MemoryStore, WorkerId) -> WorkerId) {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let [a, _] = silent_engine(&store, t0);
+    let again = change(&store, a);
+    store.record(again, 0, pressure(0, 0), t0, LoadSource::Stream);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0).len(), 2);
+}
+
+#[test]
+fn the_build_carries_no_word_over_a_returned_ranks_record_since() {
+    record_under_a_word_after(returns);
+}
+
+#[test]
+fn the_build_carries_no_word_over_a_restarted_ranks_record_since() {
+    record_under_a_word_after(restarts);
+}
+
+#[test]
+fn the_build_carries_no_word_over_the_record_of_a_rank_new_to_its_engine() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = rank_of(&store, "http://e:8000", 0);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(&[(a, 0, Some(pressure(9, 0)))], t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0), [a]);
+    store.report(&[(a, 0, None)], t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0), []);
+    // The second rank registers under the standing word and streams its
+    // record before the build.
+    let b = store.upsert(rank_facts(1)).id();
+    store.record(b, 1, pressure(0, 0), t0, LoadSource::Stream);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0).len(), 2);
+}
+
+#[test]
+fn the_word_that_no_report_came_stays_with_the_rank_whose_sibling_left() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let [a, _] = silent_engine(&store, t0);
+    store.remove(a, revision(&store, a)).expect("removed");
+    store.publish_now();
+    // The engine's last poll brought no report: the build raises no verdict
+    // again from the record the rank that stayed has on file.
+    assert_eq!(overloaded(&store, t0), []);
+}
+
+#[test]
+fn a_poll_with_no_report_for_either_rank_says_the_word_after_one_returned() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let [a, b] = two_ranks(&store);
+    let loaded = [(a, 0, Some(pressure(0, 0))), (b, 1, Some(pressure(9, 0)))];
+    store.report(&loaded, t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0).len(), 2);
+    let back = returns(&store, a);
+    // No row for the rank that returned and none for the one that stayed:
+    // the word that no report came is the engine's, and the build carries
+    // it over the record still on file.
+    store.report(&[(back, 0, None), (b, 1, None)], t0, LoadSource::Poll);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0), []);
+}
+
+#[test]
+fn a_word_keeps_its_polls_instant_across_a_build_and_stands_over_an_older_record() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let [a, b] = silent_engine(&store, t0);
+    // A later poll says the word again, and a build of another worker
+    // carries it: it keeps the instant that poll began.
+    let later = t0 + Duration::from_millis(1);
+    store.report(&[(a, 0, None), (b, 1, None)], later, LoadSource::Poll);
+    member(&store, "http://other:8000");
+    // Rank 0 returns with a record received before that poll began: no
+    // news since the word, which the next build carries.
+    let back = returns(&store, a);
+    store.record(back, 0, pressure(0, 0), t0, LoadSource::Stream);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0), []);
+}
+
+#[test]
+fn the_build_carries_no_word_over_a_restarted_ranks_record_since_the_poll_began() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let [a, b] = two_ranks(&store);
+    let loaded = [(a, 0, Some(pressure(0, 0))), (b, 1, Some(pressure(9, 0)))];
+    store.report(&loaded, t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0).len(), 2);
+    // The rank's new life streams its record while the poll is out, and the
+    // poll's answer brings no row before the build. The word is said of
+    // the rank that stands; the build finds the record the new id brought
+    // since the poll began, and carries none.
+    let new = restarts(&store, a);
+    store.record(new, 0, pressure(0, 0), t0, LoadSource::Stream);
+    store.report(&[(new, 0, None), (b, 1, None)], t0, LoadSource::Poll);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0).len(), 2);
+}
+
+#[test]
+fn a_record_from_another_engines_new_rank_ends_no_word() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    silent_engine(&store, t0);
+    // A rank of another engine registers and streams its record before the
+    // build: the news is that engine's, and this one's word stays.
+    let other = WorkerFacts {
+        engine: "http://f:8000".to_string(),
+        dp_rank: 0,
+        dp_size: 2,
+        ..facts("http://f:8000#0", Role::Single, &[MODEL])
+    };
+    let other = store.upsert(other).id();
+    store.record(other, 0, pressure(0, 0), t0, LoadSource::Stream);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0), []);
 }
 
 #[test]

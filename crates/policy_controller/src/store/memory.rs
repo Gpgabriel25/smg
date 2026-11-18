@@ -1418,13 +1418,15 @@ impl LoadSink for MemoryStore {
                 // No row came for the engine: the word that none came,
                 // unless a rank of it pushed since the poll began, whether
                 // the answer names that rank or not. The word is shown
-                // where it moves a verdict.
+                // where it moves a verdict. A rank inside its registration's
+                // window has no row here: the build reads what it reported
+                // against the word and the instant this poll began.
                 let pushed = writer.ranks_of(engine).any(|(id, rank)| {
                     table
                         .get(&id)
                         .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
                 });
-                !pushed && writer.silence(engine)
+                !pushed && writer.silence(engine, polled_at)
             };
         }
         if changed {
